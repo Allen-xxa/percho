@@ -133,6 +133,65 @@ describe("snapshots：打点与时间线", () => {
 		]);
 	});
 
+	it("capture() 之后工作区再变，record 仍拍到冻结时刻的内容（BUG E 的核心语义）", async () => {
+		if (!gitOk) return;
+		write("a.txt", "base\n");
+		await snapshots.ensureBaseline(SID, cwd, -1, true);
+		await snapshots.idle(SID);
+
+		// 第 0 轮：turn_end 里同步冻结（真实场景里这之后 1–2ms 下一轮就开始写盘）
+		write("a.txt", "turn0-done\n");
+		const frozen = snapshots.capture(SID, cwd);
+		if (!frozen) throw new Error("capture 返回 undefined");
+
+		// 冻结后**立刻**改工作区，然后才轮到异步的 record 真正落库
+		write("a.txt", "turn1-in-progress\n");
+		write("b.txt", "turn1-only\n");
+		await snapshots.record(SID, cwd, 0, true, frozen);
+		await snapshots.idle(SID);
+		// 第 1 轮正常打点
+		await snapshots.record(SID, cwd, 1, true);
+		await snapshots.idle(SID);
+
+		// 撤回第 1 轮 → 必须回到第 0 轮冻结时刻（turn0-done、无 b.txt）。
+		// 若打点没冻结（BUG E），第 0 轮的树会拍到 turn1 的内容，这里就一个字节都回不去。
+		const res = await snapshots.recallCode({
+			sessionId: SID,
+			cwd,
+			targetTurn: 1,
+			ledgerPaths: ["a.txt", "b.txt"],
+		});
+		expect(res.status).toBe("reverted");
+		expect(read("a.txt")).toBe("turn0-done\n");
+		expect(existsSync(join(cwd, "b.txt"))).toBe(false);
+	});
+
+	it("不给 captured 时 record 在入口同步冻结（兜底打点也安全）", async () => {
+		if (!gitOk) return;
+		write("a.txt", "base\n");
+		await snapshots.ensureBaseline(SID, cwd, -1, true);
+		await snapshots.idle(SID);
+
+		write("a.txt", "frozen-at-call\n");
+		// 不 await：record 的第一个 await 之前就必须把 index 冻结住
+		const pending = snapshots.record(SID, cwd, 0, true);
+		write("a.txt", "written-after-call\n");
+		await pending;
+		await snapshots.idle(SID);
+
+		await snapshots.record(SID, cwd, 1, true);
+		await snapshots.idle(SID);
+
+		const res = await snapshots.recallCode({
+			sessionId: SID,
+			cwd,
+			targetTurn: 1,
+			ledgerPaths: ["a.txt"],
+		});
+		expect(res.status).toBe("reverted");
+		expect(read("a.txt")).toBe("frozen-at-call\n");
+	});
+
 	it("元数据落盘后可被新实例读回", async () => {
 		if (!gitOk) return;
 		write("a.txt", "x\n");

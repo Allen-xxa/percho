@@ -227,10 +227,7 @@ describe("PiBackend 撤回代码（阶段 3 接线）", () => {
 				writeFileSync(join(f.cwd, "a.txt"), "after-first\n");
 				await gate;
 			} else {
-				// 真实场景第二轮要先发一次模型请求（几百毫秒），足够上一轮的打点落地；
-				// 这里没有网络延迟，必须自己让出时间，否则 turn 0 的快照会拍到第二轮的内容
-				// （打点是异步队列，见 IMPL-NOTES「打点与下一轮的竞态」）。
-				await new Promise((r) => setTimeout(r, 300));
+				// ❗ 不加任何延迟：BUG E 修好后 turn_end 已同步冻结 index，第二轮立即写盘也不影响
 				writeFileSync(join(f.cwd, "a.txt"), "after-second\n");
 			}
 		});

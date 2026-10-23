@@ -4,6 +4,7 @@ import { JsonStore } from "../json-store";
 import { createLogger } from "../log";
 import {
 	buildFilteredTree,
+	captureIndex,
 	checkoutTree,
 	commitTree,
 	deleteSnapshots,
@@ -20,6 +21,7 @@ import {
 	runGit,
 	type ShadowRepo,
 	snapshotTree,
+	writeCapturedTreeSync,
 } from "./snapshot-git";
 
 const log = createLogger("snapshots");
@@ -42,6 +44,13 @@ export interface SnapshotEntry {
 	/** 被剔除的路径（大文件/嵌套仓库），仅调试 */
 	skipped: string[];
 	kind: "baseline" | "turn" | "recall";
+}
+
+/** `capture()` 同步冻结的产物：index 已落成 tree，后续只剩异步的 commit/trim/persist */
+export interface CapturedIndex {
+	treeOid: string;
+	/** 被剔除的路径（超大文件、嵌套仓库） */
+	skipped: string[];
 }
 
 export interface SnapshotState {
@@ -174,7 +183,13 @@ export class SessionSnapshots {
 	 * 打点后，同一 turnIndex 会被打多次（每次 turn_end 都是一次完整的工作区状态）。
 	 * 覆盖时把旧条目的 ref 一并删掉（它指向的 commit 已被新条目接管）。
 	 */
-	async record(sessionId: string, cwd: string, turnIndex: number, exclusive: boolean): Promise<void> {
+	async record(
+		sessionId: string,
+		cwd: string,
+		turnIndex: number,
+		exclusive: boolean,
+		captured?: CapturedIndex,
+	): Promise<void> {
 		if (!this.gitAvailable) return;
 		const rt = this.sessions.get(sessionId);
 		if (!rt) {
@@ -186,9 +201,13 @@ export class SessionSnapshots {
 			log.warn("cwd 与会话快照库不一致，跳过打点", sessionId, rt.repo.workTree, cwd);
 			return;
 		}
+		// ❗ 冻结必须在**入口同步**完成（第一个 await 之前）：排进队列再拍的话，轮到它时
+		// 下一轮可能已经改完文件（BUG E）。调用方已冻结时直接复用。
+		const frozen = captured ?? this.capture(sessionId, cwd);
+		if (!frozen) return;
 		try {
 			await this.enqueue(rt, async () => {
-				const { treeOid, skipped } = await snapshotTree(rt.repo, { skipOverBytes: this.skipOverBytes });
+				const { treeOid, skipped } = frozen;
 				// 同 turnIndex 覆盖（同轮多次 turn_end）：**必须先摘掉旧条目和它的 ref**，
 				// 再建新 ref —— 否则新 ref 与旧 ref 同名，刚建好就被下面这行删掉。
 				const existing = rt.state.snapshots.findIndex((s) => s.turnIndex === turnIndex);
@@ -218,6 +237,29 @@ export class SessionSnapshots {
 			});
 		} catch (err) {
 			log.warn("打点失败", sessionId, String(err));
+		}
+	}
+
+	/**
+	 * **同步**冻结工作区（BUG E）：必须在 `turn_end` 回调里直接调用并返回，
+	 * 之后工作区再变也不影响这棵树。返回 `undefined` 表示这次不该打点（未初始化 / cwd 不符）。
+	 *
+	 * ⚠️ 阻塞主线程 30ms 量级（增量），见 `snapshot-git.ts` 的 `captureIndex`。
+	 */
+	capture(sessionId: string, cwd: string): CapturedIndex | undefined {
+		if (!this.gitAvailable) return undefined;
+		const rt = this.sessions.get(sessionId);
+		if (!rt) return undefined;
+		if (resolve(cwd) !== resolve(rt.repo.workTree)) return undefined;
+		try {
+			// add -A 与 write-tree 都同步跑完：index 与树一起冻结，之后工作区再变不影响。
+			// write-tree 只是遍历 index 建 tree 对象（blob 已在 add 时落库），开销可忽略。
+			const skipped = captureIndex(rt.repo, { skipOverBytes: this.skipOverBytes });
+			const treeOid = writeCapturedTreeSync(rt.repo);
+			return { treeOid, skipped };
+		} catch (err) {
+			log.warn("冻结 index 失败（本轮不打点）", sessionId, String(err));
+			return undefined;
 		}
 	}
 

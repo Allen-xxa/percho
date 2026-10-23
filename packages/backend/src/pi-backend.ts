@@ -119,7 +119,7 @@ import {
 import { renameSessionFile } from "./session/rename";
 import { emitSessionShutdown } from "./session/shutdown";
 import { KeyedSingleFlight } from "./session/single-flight";
-import { type RecallCodeResult, SessionSnapshots } from "./session/snapshots";
+import { type CapturedIndex, type RecallCodeResult, SessionSnapshots } from "./session/snapshots";
 import { StreamGuard } from "./session/stream-guard";
 import { TraceRecorder } from "./session/trace";
 import { SessionTraces } from "./session/traces";
@@ -766,19 +766,24 @@ export class PiBackend {
 		// 打点触发点：**turn_end 为主**（一次 run 里 followUp 排队会有多轮，只靠 agent_settled
 		// 会跳过中间那些轮，见 review BUG C），agent_settled 兜底。
 		// 同一 turnIndex 的多次打点由 SessionSnapshots.record 覆盖（同轮多次 turn_end 是常态）。
-		const snap = (): void => {
+		// ❗ `turn_end` → 下一轮写盘只隔 1–2ms（review BUG E 实测 +12ms / +14ms）。所以
+		// `turn_end` 里必须**同步**冻结 index（`capture`），之后工作区再变也不影响这棵树；
+		// 落树/建 ref/persist 仍然异步排队。不冻结的话排队轮到 add -A 时下一轮已改完文件，
+		// 两轮拍成同一棵树 → 撤回静默空转。
+		const snap = (frozen?: CapturedIndex): void => {
 			if (session.isCompacting) return;
-			void this.snapshots.record(sessionId, cwd, turnIndexOf(), this.isExclusiveCwd(cwd, sessionId));
+			void this.snapshots.record(sessionId, cwd, turnIndexOf(), this.isExclusiveCwd(cwd, sessionId), frozen);
 		};
 		const unsubscribe = session.subscribe((event) => {
 			if (event.type === "turn_end") {
 				// ❗ 不要判 `event.aborted`：那是 agent_settled 的字段，turn_end 里没有。
 				// abort 前已完成的轮次是真实改动，仍要打点。
-				snap();
+				// 也不判 isStreaming：turn_end 时它本来就是 true（agent_settled 才是 false）。
+				snap(this.snapshots.capture(sessionId, cwd));
 				return;
 			}
 			if (event.type !== "agent_settled") return;
-			// settled 只兜底（turn_end 已经拍过同一 turnIndex 会被覆盖，代价只是一次 add -A）
+			// settled 只兜底（同 turnIndex 会被覆盖，代价只是一次 add -A）
 			if (session.isStreaming) return;
 			snap();
 		});

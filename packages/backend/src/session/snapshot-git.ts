@@ -1,4 +1,5 @@
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { statSync } from "node:fs";
 import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createLogger } from "../log";
@@ -163,11 +164,8 @@ export interface RunGitOptions {
  * 统一出口：注入三环境变量 + 固定 config + 固定身份。
  * **stderr 不抛**（由调用方判 code）—— 冲突、缺 ref 等都是预期分支。
  */
-export async function runGit(
-	repo: ShadowRepo,
-	args: string[],
-	opts: RunGitOptions = {},
-): Promise<GitRunResult> {
+/** 三环境变量 + 固定身份；同步与异步出口共用（改一处即可） */
+function buildGitEnv(repo: ShadowRepo): Record<string, string> {
 	const env: Record<string, string> = {
 		...IDENTITY,
 		GIT_DIR: repo.gitDir,
@@ -180,6 +178,15 @@ export async function runGit(
 	}
 	// 显式清掉可能继承来的 GIT_* 干扰项（GIT_NAMESPACE 等会让命令跑到别处）
 	delete env.GIT_NAMESPACE;
+	return env;
+}
+
+export async function runGit(
+	repo: ShadowRepo,
+	args: string[],
+	opts: RunGitOptions = {},
+): Promise<GitRunResult> {
+	const env = buildGitEnv(repo);
 
 	return new Promise<GitRunResult>((resolve) => {
 		const child = execFile(
@@ -216,17 +223,7 @@ async function runGitBuffer(
 	args: string[],
 	opts: RunGitOptions = {},
 ): Promise<{ buffer: Buffer; code: number; stderr: string }> {
-	const env: Record<string, string> = {
-		...IDENTITY,
-		GIT_DIR: repo.gitDir,
-		GIT_WORK_TREE: repo.workTree,
-		GIT_INDEX_FILE: repo.indexPath,
-		GIT_TERMINAL_PROMPT: "0",
-	};
-	for (const key of Object.keys(process.env)) {
-		if (env[key] === undefined && process.env[key] !== undefined) env[key] = process.env[key] as string;
-	}
-	delete env.GIT_NAMESPACE;
+	const env = buildGitEnv(repo);
 	return new Promise((resolve) => {
 		const child = execFile(
 			"git",
@@ -315,23 +312,6 @@ export interface SnapshotTreeResult {
  *   所以 `endsWith("/")` 过滤依然成立。实测代价：本仓 25ms/174B → 30ms/36.9KB（index 全空的最坏情况）。
  * - 仍然 `stat(<dir>/.git)` 兜底，防 git 折叠了别的东西。
  */
-async function findNestedRepos(repo: ShadowRepo): Promise<string[]> {
-	const listed = await runGit(repo, ["ls-files", "-o", "--exclude-standard", "-z"]);
-	if (listed.code !== 0) return [];
-	const found: string[] = [];
-	for (const entry of listed.stdout.split("\0")) {
-		if (!entry.endsWith("/")) continue;
-		const dir = entry.slice(0, -1);
-		const dotGit = join(repo.workTree, dir, ".git");
-		try {
-			await stat(dotGit);
-			found.push(dir);
-		} catch {
-			// 普通目录（非嵌套仓库），正常入库
-		}
-	}
-	return found;
-}
 
 /**
  * 现拍一棵树。
@@ -347,63 +327,129 @@ export async function snapshotTree(
 	repo: ShadowRepo,
 	opts: { skipOverBytes: number },
 ): Promise<SnapshotTreeResult> {
+	const skipped = captureIndex(repo, opts);
+	const treeOid = await writeCapturedTree(repo);
+	return { treeOid, skipped };
+}
+
+/**
+ * 同步冻结 index —— **这是 BUG E 的解法**。
+ *
+ * `turn_end` 到下一轮真正写盘只隔 1–2ms（review 实测 +12ms / +14ms）。若打点只是
+ * `void record(...)`（仅入队），排队轮到 `add -A` 时下一轮已经改完文件 → 两轮拍成同一棵树，
+ * 撤回静默空转。所以 `turn_end` 回调里必须**同步**跑完 `add -A`：一旦 index 冻结，
+ * 工作区之后怎么变都不影响这棵树（实测确认）。
+ *
+ * ⚠️ **会阻塞主线程**：`execFileSync` 跑几次 git（增量 30ms 量级；首轮全量 3.2s 一次性）。
+ * 这是刻意的取舍 —— 一轮结束时的这点抖动，换的是「快照真的对应那一轮」。
+ * 后续 `write-tree`/`commit-tree`/trim/persist 仍然异步（见 `writeCapturedTree`）。
+ */
+export function captureIndex(repo: ShadowRepo, opts: { skipOverBytes: number }): string[] {
 	const skipped: string[] = [];
 
 	// 1) 嵌套仓库：add 之前排除（否则 add -A 直接失败）
-	const nested = await findNestedRepos(repo);
+	const nested = findNestedReposSync(repo);
 	const addArgs = ["add", "-A"];
 	if (nested.length > 0) {
 		addArgs.push("--");
 		for (const dir of nested) addArgs.push(`:(exclude)${dir}`);
 	}
-	const added = await runGit(repo, addArgs);
+	const added = runGitSync(repo, addArgs);
 	if (added.code !== 0) throw new Error(`git add -A failed: ${added.stderr.trim()}`);
 	skipped.push(...nested);
 
 	// 2) 超大文件：按磁盘真实大小判定
-	const listed = await runGit(repo, ["ls-files", "-z"]);
+	const listed = runGitSync(repo, ["ls-files", "-z"]);
 	if (listed.code !== 0) throw new Error(`git ls-files failed: ${listed.stderr.trim()}`);
-	const paths = listed.stdout.split("\0").filter(Boolean);
 	const tooBig: string[] = [];
-	for (const path of paths) {
+	for (const path of listed.stdout.split("\0")) {
+		if (!path) continue;
 		try {
-			const st = await stat(join(repo.workTree, path));
+			const st = statSync(join(repo.workTree, path));
 			if (st.isFile() && st.size > opts.skipOverBytes) tooBig.push(path);
 		} catch {
 			// 快照期间被删掉的文件：留给 git 自己处理
 		}
 	}
 	if (tooBig.length > 0) {
-		await forceRemoveFromIndex(repo, tooBig);
+		forceRemoveFromIndexSync(repo, tooBig);
 		skipped.push(...tooBig);
 	}
 
 	// 3) gitlink 兜底（有 commit 的嵌套仓库会绕过第 1 步的 pathspec 排除）
-	const staged = await runGit(repo, ["ls-files", "-s", "-z"]);
+	const staged = runGitSync(repo, ["ls-files", "-s", "-z"]);
 	if (staged.code !== 0) throw new Error(`git ls-files -s failed: ${staged.stderr.trim()}`);
 	const gitlinks: string[] = [];
 	for (const entry of staged.stdout.split("\0")) {
 		if (!entry.startsWith("160000 ")) continue;
-		const tab = entry.indexOf("\t");
+		const tab = entry.indexOf("	");
 		if (tab >= 0) gitlinks.push(entry.slice(tab + 1));
 	}
 	if (gitlinks.length > 0) {
-		await forceRemoveFromIndex(repo, gitlinks);
+		forceRemoveFromIndexSync(repo, gitlinks);
 		for (const link of gitlinks) if (!skipped.includes(link)) skipped.push(link);
 	}
 
-	const tree = await runGit(repo, ["write-tree"]);
-	if (tree.code !== 0) throw new Error(`git write-tree failed: ${tree.stderr.trim()}`);
-	return { treeOid: tree.stdout.trim(), skipped };
+	return skipped;
 }
 
-/** 从 index 剔除路径。**`git rm --cached` 不可用**（报 `has staged content different from both the file and the HEAD`） */
-async function forceRemoveFromIndex(repo: ShadowRepo, paths: string[]): Promise<void> {
+/** 把 `captureIndex` 冻结的 index 落成 tree（异步，可安全排队） */
+export async function writeCapturedTree(repo: ShadowRepo): Promise<string> {
+	const tree = await runGit(repo, ["write-tree"]);
+	if (tree.code !== 0) throw new Error(`git write-tree failed: ${tree.stderr.trim()}`);
+	return tree.stdout.trim();
+}
+
+/** 同步版 `write-tree`：与 `captureIndex` 一起在 turn_end 回调里跑完，index 与树同时冻结 */
+export function writeCapturedTreeSync(repo: ShadowRepo): string {
+	const tree = runGitSync(repo, ["write-tree"]);
+	if (tree.code !== 0) throw new Error(`git write-tree failed: ${tree.stderr.trim()}`);
+	return tree.stdout.trim();
+}
+
+/** `runGit` 的同步版：只给 `captureIndex` 用（必须在 turn_end 回调里跑完） */
+function runGitSync(repo: ShadowRepo, args: string[], input?: string): GitRunResult {
+	try {
+		const stdout = execFileSync("git", [...BASE_CONFIG, ...args], {
+			cwd: repo.workTree,
+			env: buildGitEnv(repo),
+			...(input === undefined ? {} : { input }),
+			maxBuffer: 64 * 1024 * 1024,
+			timeout: DEFAULT_TIMEOUT_MS,
+			encoding: "utf8",
+			stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+		});
+		return { stdout, stderr: "", code: 0 };
+	} catch (error) {
+		const e = error as { status?: number | null; stdout?: string; stderr?: string; code?: number };
+		const code = typeof e.status === "number" ? e.status : typeof e.code === "number" ? e.code : 1;
+		return { stdout: e.stdout ?? "", stderr: e.stderr ?? "", code };
+	}
+}
+
+function forceRemoveFromIndexSync(repo: ShadowRepo, paths: string[]): void {
 	if (paths.length === 0) return;
 	// NUL 分隔避免路径里的空格/引号被转义
 	const input = `${paths.join("\0")}\0`;
-	const r = await runGit(repo, ["update-index", "--force-remove", "-z", "--stdin"], { input });
+	const r = runGitSync(repo, ["update-index", "--force-remove", "-z", "--stdin"], input);
 	if (r.code !== 0) throw new Error(`update-index --force-remove failed: ${r.stderr.trim()}`);
+}
+
+function findNestedReposSync(repo: ShadowRepo): string[] {
+	const listed = runGitSync(repo, ["ls-files", "-o", "--exclude-standard", "-z"]);
+	if (listed.code !== 0) return [];
+	const found: string[] = [];
+	for (const entry of listed.stdout.split("\0")) {
+		if (!entry.endsWith("/")) continue;
+		const dir = entry.slice(0, -1);
+		try {
+			statSync(join(repo.workTree, dir, ".git"));
+			found.push(dir);
+		} catch {
+			// 普通目录（非嵌套仓库），正常入库
+		}
+	}
+	return found;
 }
 
 /** 把 tree 提交成 commit（影子库内部对象，仅调试可读；代码逻辑不依赖） */
