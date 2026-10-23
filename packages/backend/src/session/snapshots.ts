@@ -104,9 +104,8 @@ interface SessionRuntime {
 	/** 私有 index 文件序号（每次操作一个新文件，避免撞 `index.lock`） */
 	indexSeq: number;
 	/**
-	 * live index 是否已建立。未建立时增量基线不存在，`capture()` 只能做全量 `add -A`
-	 * （真实仓库实测：基线进行中约 520ms，完全无基线在跑时约 3.7s），都是同步阻塞主线程，
-	 * 所以那种情况直接放弃本轮打点 —— 基线本身在做同样的活，那一轮会 out-of-window（诚实降级）。
+	 * live index 是否已建立（仅诊断用，**不作为早退条件**，见 BUG H）。
+	 * 未建立时 `capture()` 退化成全量 `add -A`，成功后自动置位。
 	 */
 	liveIndexReady: boolean;
 }
@@ -263,14 +262,12 @@ export class SessionSnapshots {
 		const rt = this.sessions.get(sessionId);
 		if (!rt) return undefined;
 		if (resolve(cwd) !== resolve(rt.repo.workTree)) return undefined;
-		if (!rt.liveIndexReady) {
-			// live index 还没建立（基线正在跑或失败了）：私有 index 从空开始 → `add -A` 退化成
-			// **全量**（真实仓库实测：基线进行中约 520ms，完全无基线时约 3.7s，都是同步阻塞
-			// 主线程）。这一轮直接放弃打点 —— 基线本身正在做同样的活，那一轮会 out-of-window，
-			// 比在对话中途卡住 UI 好。
-			log.debug("live index 未建立，跳过本轮打点", sessionId, `turn=${turnIndex ?? "?"}`);
-			return undefined;
-		}
+		// ❗ 不要在这里判 `liveIndexReady` 早退（BUG H）：`withPrivateIndexSync` 在 live 缺失时
+		// 已经会退化成「空 index + 全量 add -A」，成功后自然把 live 建起来并置位。早退的话
+		// 没有任何路径能再把它变 true —— 只要 live 文件丢过一次（进程在 rename 前被杀 /
+		// 用户删了 *.index / add -A 抛错），这个会话之后**永久**丢点。
+		// 全量代价实测：基线进行中约 520ms（复用基线正在写的 blob），完全无基线时约 3.7s。
+		if (!rt.liveIndexReady) log.debug("live index 未建立，本轮走全量", sessionId, `turn=${turnIndex ?? "?"}`);
 		try {
 			// add -A 与 write-tree 都同步跑完：index 与树一起冻结，之后工作区再变不影响。
 			// write-tree 只是遍历 index 建 tree 对象（blob 已在 add 时落库），开销可忽略。
