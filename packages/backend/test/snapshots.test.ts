@@ -63,7 +63,7 @@ describe("snapshots：打点与时间线", () => {
 		expect(entries[0]?.exclusive).toBe(true);
 	});
 
-	it("内容没变的轮次不建 commit（只记元数据）", async () => {
+	it("内容没变的轮次不新建 commit 对象，但本条仍持有自己的 ref（复用同一 commit）", async () => {
 		if (!gitOk) return;
 		write("a.txt", "same\n");
 		await snapshots.ensureBaseline(SID, cwd, -1, true);
@@ -71,8 +71,21 @@ describe("snapshots：打点与时间线", () => {
 		await round(0, {});
 		const entries = snapshots.entriesOf(SID);
 		expect(entries).toHaveLength(2);
-		expect(entries[1]?.commitOid).toBeUndefined();
+		// 不重复写 commit 对象：复用基线那条的 commit OID
+		expect(entries[1]?.commitOid).toBe(entries[0]?.commitOid);
 		expect(entries[1]?.treeOid).toBe(entries[0]?.treeOid);
+		// ❗ 但 ref 必须各自存在：否则基线那条被裁掉时，本条共享的树会连带被 prune（BUG B）
+		expect(entries[1]?.ref).toBe("refs/snap/turn-0");
+		const refs = await rawGit(null, [
+			"--git-dir",
+			join(snapDir, `${SID}.git`),
+			"for-each-ref",
+			"--format=%(refname)",
+		]);
+		expect(refs.stdout.split("\n").filter(Boolean).sort()).toEqual([
+			"refs/snap/baseline--1",
+			"refs/snap/turn-0",
+		]);
 	});
 
 	it("元数据落盘后可被新实例读回", async () => {
@@ -549,6 +562,82 @@ describe("snapshots：撤回", () => {
 		});
 		expect(ok.status).toBe("reverted");
 		expect(read("a.txt")).toBe("r0\n");
+		await small.disposeAll();
+	});
+
+	it("基线还在、但目标轮早于基线 → out-of-window（不能拿基线顶替）", async () => {
+		if (!gitOk) return;
+		await snapshots.disposeAll();
+		// 会话在第 3 轮之后才打开：基线 turnIndex = 3
+		// 用新 sessionId：describe 级 beforeEach 已给 SID 建了 turnIndex=-1 的基线
+		const mid = "sess-mid";
+		const small = new SessionSnapshots({ dir: snapDir });
+		await small.init();
+		write("a.txt", "state-after-turn3\n");
+		await small.ensureBaseline(mid, cwd, 3, true);
+		await small.idle(mid);
+		// 第 4 轮：改 a.txt + 新建 c.txt
+		write("a.txt", "state-after-turn4\n");
+		write("c.txt", "created-in-turn4\n");
+		await small.record(mid, cwd, 4, true);
+		await small.idle(mid);
+		expect(small.entriesOf(mid).map((e) => [e.kind, e.turnIndex])).toEqual([
+			["baseline", 3],
+			["turn", 4],
+		]);
+
+		// 撤回第 2 轮：beforeTurn(2) 要 turnIndex 1，快照里没有 → out-of-window
+		const res = await small.recallCode({
+			sessionId: mid,
+			cwd,
+			targetTurn: 2,
+			ledgerPaths: ["a.txt", "c.txt"],
+			isExclusiveNow: true,
+		});
+		expect(res.status).toBe("conflict");
+		if (res.status === "conflict") expect(res.reason).toBe("out-of-window");
+		// ❗ 工作区一个字节都不能动：既不能倒回第 3 轮，也不能删掉第 4 轮新建的 c.txt
+		expect(read("a.txt")).toBe("state-after-turn4\n");
+		expect(read("c.txt")).toBe("created-in-turn4\n");
+		await small.disposeAll();
+	});
+
+	it("空轮次（内容没变）的条目在后续裁剪 + GC 后树仍在（BUG B）", async () => {
+		if (!gitOk) return;
+		await snapshots.disposeAll();
+		// maxSnapshots=2 加速：两轮就触发裁剪 + repack + prune
+		const empty = "sess-empty";
+		const small = new SessionSnapshots({ dir: snapDir, maxSnapshots: 2 });
+		await small.init();
+		write("a.txt", "base\n");
+		await small.ensureBaseline(empty, cwd, -1, true);
+		await small.idle(empty);
+		// 第 0 轮：什么都没改（内容与基线相同）→ 复用 commit，但要有自己的 ref
+		await small.record(empty, cwd, 0, true);
+		await small.idle(empty);
+		const turn0Tree = small.entriesOf(empty)[1]?.treeOid ?? "";
+		expect(turn0Tree).not.toBe("");
+		// 第 1 轮：改文件 → 条目溢出，基线那条被裁掉 + GC
+		write("a.txt", "r1\n");
+		await small.record(empty, cwd, 1, true);
+		await small.idle(empty);
+		expect(small.entriesOf(empty).map((e) => e.turnIndex)).toEqual([0, 1]);
+
+		// turn 0 的树必须仍然可达（GC 不能因为基线被裁就把它清掉）
+		const cat = await rawGit(null, ["--git-dir", join(snapDir, `${empty}.git`), "cat-file", "-t", turn0Tree]);
+		expect(cat.code).toBe(0);
+		expect(cat.stdout.trim()).toBe("tree");
+
+		// 撤回第 1 轮需要 turn 0 的树：不能 unavailable
+		const res = await small.recallCode({
+			sessionId: empty,
+			cwd,
+			targetTurn: 1,
+			ledgerPaths: ["a.txt"],
+			isExclusiveNow: true,
+		});
+		expect(res.status).toBe("reverted");
+		expect(read("a.txt")).toBe("base\n");
 		await small.disposeAll();
 	});
 });

@@ -65,6 +65,10 @@ export interface RecallCodeSuccess {
 	status: "reverted";
 	reverted: string[];
 	deleted: string[];
+	/**
+	 * 「已经是目标状态、无需动作」的路径（二进制闸门里当前 blob == theirs 的那些）。
+	 * 用户视角和 `reverted` 一样是「没动」，**不是失败项**。
+	 */
 	skipped: string[];
 	/** 对话侧失败时调用，把工作区拨回撤回前的样子 */
 	rollback: () => Promise<void>;
@@ -181,9 +185,13 @@ export class SessionSnapshots {
 			await this.enqueue(rt, async () => {
 				const { treeOid, skipped } = await snapshotTree(rt.repo, { skipOverBytes: this.skipOverBytes });
 				const last = rt.state.snapshots[rt.state.snapshots.length - 1];
-				// 内容没变 → 不建 commit，只记一条元数据（省对象、省时间）
+				// 内容没变 → 不新建 commit 对象，但**仍然给本条目自己的 ref**（复用同一个 commit OID）。
+				// 理由：ref 是条目的 liveness。若让本条 ref 空着、只靠前一条的 ref 撑着这棵树，
+				// 一旦前一条被 trim 裁掉，这条还在窗口内的条目就会连带被 prune 掉（BUG B）。
 				const commit =
-					last?.treeOid === treeOid ? undefined : await this.commitOrNull(rt, treeOid, "turn", turnIndex);
+					last?.treeOid === treeOid && last.commitOid
+						? await this.pointRef(rt, "turn", turnIndex, last.commitOid)
+						: await this.commitOrNull(rt, treeOid, "turn", turnIndex);
 				rt.state.snapshots.push({
 					turnIndex,
 					treeOid,
@@ -324,7 +332,11 @@ export class SessionSnapshots {
 				// 没写盘 = 工作区还是 ours 的样子，index 必须与之一致（拍不出 ours 时退化成 last.treeOid）
 				const target = ours ?? last.treeOid;
 				await resetIndexTo(rt.repo, target).catch((err: unknown) => {
-					log.warn("恢复 index 失败（下次打点可能算错增量）", rt.sessionId, String(err));
+					log.warn(
+						"恢复 index 失败（下次打点可能算错增量，下次撤回可能漏删文件）",
+						rt.sessionId,
+						String(err),
+					);
 				});
 			}
 		}
@@ -484,6 +496,23 @@ export class SessionSnapshots {
 		return next;
 	}
 
+	/** 把 `refs/snap/<kind>-<turnIndex>` 指向已有 commit（内容没变的轮次复用同一 commit） */
+	private async pointRef(
+		rt: SessionRuntime,
+		kind: SnapshotEntry["kind"],
+		turnIndex: number,
+		commitOid: string,
+	): Promise<{ commitOid: string; ref: string } | undefined> {
+		const ref = `refs/snap/${kind}-${turnIndex}`;
+		try {
+			await runGit(rt.repo, ["update-ref", ref, commitOid]);
+			return { commitOid, ref };
+		} catch (err) {
+			log.warn("写快照 ref 失败（只影响调试可读性与可达性）", ref, String(err));
+			return undefined;
+		}
+	}
+
 	private async commitOrNull(
 		rt: SessionRuntime,
 		treeOid: string,
@@ -504,15 +533,26 @@ export class SessionSnapshots {
 	}
 
 	/**
-	 * 保留窗口裁剪：从头部删，删掉的条目对应 ref 一起清，然后异步回收。
+	 * 保留窗口裁剪：从头部删，删掉的条目对应 ref 一起清，然后回收。
 	 * `forceGc` 用于「刚删了一批 ref」的场合（撤回丢弃整段历史），否则只在真裁剪时才回收
 	 * —— 每次打点都 repack 会把快照成本从 130ms 抬到秒级。
+	 *
+	 * ❗ GC **必须排进队列**（不能 `void` 甩出去）：`prune --expire=now` 会删掉所有不可达对象，
+	 * 而下一次 `record` 的 `add -A` 刚写进去的 blob 此刻正是不可达的（还没 commit/ref 指向），
+	 * 被 prune 后紧接着的 `write-tree` 就会报缺对象。
 	 */
 	private async trim(rt: SessionRuntime, forceGc = false): Promise<void> {
 		const overflow = rt.state.snapshots.length - this.maxSnapshots;
 		const dropped = overflow > 0 ? rt.state.snapshots.splice(0, overflow) : [];
 		if (dropped.length > 0) await deleteSnapshots(rt.repo, refsOf(dropped));
-		if (dropped.length > 0 || forceGc) void gcShadowRepo(rt.repo);
+		if (dropped.length > 0 || forceGc) {
+			// ❗ 直接 await，不再 enqueue：trim 的调用方都已经在 enqueue 内，嵌套 enqueue 会等自己
+			// 的 tail → 死锁（实测整轮超时 5s）。直接 await 就已经在串行队列里了，
+			// 这也保证 GC 不会跟下一次 `add -A` 撞车（prune 会删掉刚写入但尚未被引用的 blob）。
+			await gcShadowRepo(rt.repo).catch((err: unknown) => {
+				log.warn("回收快照对象失败（只是占空间）", rt.sessionId, String(err));
+			});
+		}
 	}
 
 	private async persist(rt: SessionRuntime): Promise<void> {
@@ -532,11 +572,9 @@ function beforeTurn(snapshots: SnapshotEntry[], targetTurn: number): SnapshotEnt
 		const entry = snapshots[i];
 		if (entry && entry.turnIndex === want) return entry;
 	}
-	// 会话是中途打开的（基线 turnIndex 可能 > -1）：只要想要的那一轮不早于基线，就用基线兜底。
-	// ❗ 不能无条件回退到基线 —— 那会把「目标轮已超出保留窗口」误当成可撤回，
-	// 静默把工作区倒回很久以前。
-	const baseline = snapshots.find((s) => s.kind === "baseline");
-	if (baseline && want <= baseline.turnIndex) return baseline;
+	// 找不到就是超出保留窗口，**不能用基线顶替**：基线条目本身就在数组里（`ensureBaseline` push 了它），
+	// 循环已经覆盖了它。能走到这里的唯一情况是 `want < baseline.turnIndex` —— 目标轮早于会话开始，
+	// 快照里根本没有那个状态，拿基线顶替会静默把工作区倒回很久以前（review BUG A）。
 	return undefined;
 }
 
