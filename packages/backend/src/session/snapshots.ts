@@ -46,13 +46,6 @@ export interface SnapshotEntry {
 	/** 被剔除的路径（大文件/嵌套仓库），仅调试 */
 	skipped: string[];
 	kind: "baseline" | "turn" | "recall";
-	/**
-	 * 仅基线条目可能为 true：拍基线期间已经有轮次结束，说明这棵树里混进了那一轮的改动，
-	 * 它**不是**「会话打开那一刻的工作区」。这种基线不能当可撤回的起点（review BUG G）——
-	 * 否则撤回那几轮会 `diff(baseline, baseline)` 为空，报「已撤回」却一个字节没动。
-	 * 保留条目本身（它还承担 live index 与「更早祖先」的角色），只在定位起点时跳过。
-	 */
-	polluted?: boolean;
 }
 
 /** `capture()` 同步冻结的产物：index 已落成 tree，后续只剩异步的 commit/trim/persist */
@@ -112,11 +105,10 @@ interface SessionRuntime {
 	indexSeq: number;
 	/**
 	 * live index 是否已建立。未建立时增量基线不存在，`capture()` 只能做全量 `add -A`
-	 * （实测 3.7s 同步阻塞主线程），所以那种情况直接放弃本轮打点（review 补充策略 1）。
+	 * （真实仓库实测：基线进行中约 520ms，完全无基线在跑时约 3.7s），都是同步阻塞主线程，
+	 * 所以那种情况直接放弃本轮打点 —— 基线本身在做同样的活，那一轮会 out-of-window（诚实降级）。
 	 */
 	liveIndexReady: boolean;
-	/** 基线还在跑时就有轮次结束 → 该基线被污染（BUG G） */
-	sawTurnDuringBaseline: boolean;
 }
 
 const noop = async (): Promise<void> => {};
@@ -175,16 +167,9 @@ export class SessionSnapshots {
 			if (rt.state.snapshots.length > 0) return;
 			await this.enqueue(rt, async () => {
 				if (rt.state.snapshots.length > 0) return;
-				// ❗ 污染检测（review BUG G）：基线语义是「会话打开那一刻的工作区」，但这里拍的
-				// 是「异步任务真正跑完那一刻的工作区」，中间隔几秒。若这期间已经有轮次结束
-				// （`record` 里记了 sawTurnDuringBaseline），这棵树里就混进了那一轮的改动。
-				// 不能丢弃它（否则 live index 也没了，之后每次 capture 都退化成 3.7s 全量），
-				// 只能标记 polluted —— 它继续当 live index 与「更早祖先」，但不能当可撤回起点。
 				const { treeOid, skipped } = await this.withPrivateIndex(rt, (repo) =>
 					snapshotTree(repo, { skipOverBytes: this.skipOverBytes }),
 				);
-				// ❗ 必须在拍完之后读：拍基线本身要几秒，污染恰恰发生在这几秒里。
-				const polluted = rt.sawTurnDuringBaseline;
 				const commit = await this.commitOrNull(rt, treeOid, "baseline", baselineTurnIndex);
 				rt.state.snapshots.push({
 					turnIndex: baselineTurnIndex,
@@ -194,11 +179,7 @@ export class SessionSnapshots {
 					exclusive,
 					skipped,
 					kind: "baseline",
-					...(polluted ? { polluted: true } : {}),
 				});
-				if (polluted) {
-					log.warn("基线被并入了已结束轮次的改动，不能作为撤回起点", sessionId);
-				}
 				await this.persist(rt);
 			});
 		} catch (err) {
@@ -232,8 +213,6 @@ export class SessionSnapshots {
 			log.warn("cwd 与会话快照库不一致，跳过打点", sessionId, rt.repo.workTree, cwd);
 			return;
 		}
-		// 基线还在跑就有轮次结束 → 基线树会被这一轮的改动污染（review BUG G）
-		if (!rt.state.snapshots.some((s) => s.kind === "baseline")) rt.sawTurnDuringBaseline = true;
 		// ❗ 冻结必须在**入口同步**完成（第一个 await 之前）：排进队列再拍的话，轮到它时
 		// 下一轮可能已经改完文件（BUG E）。调用方已冻结时直接复用。
 		const frozen = captured ?? this.capture(sessionId, cwd);
@@ -286,8 +265,9 @@ export class SessionSnapshots {
 		if (resolve(cwd) !== resolve(rt.repo.workTree)) return undefined;
 		if (!rt.liveIndexReady) {
 			// live index 还没建立（基线正在跑或失败了）：私有 index 从空开始 → `add -A` 退化成
-			// **全量**（真实仓库实测 3687ms，还是同步阻塞主线程）。这一轮直接放弃打点，
-			// 基线本身正在做同样的活；那一轮会 out-of-window，总比卡死 UI 好（review 补充策略 1）。
+			// **全量**（真实仓库实测：基线进行中约 520ms，完全无基线时约 3.7s，都是同步阻塞
+			// 主线程）。这一轮直接放弃打点 —— 基线本身正在做同样的活，那一轮会 out-of-window，
+			// 比在对话中途卡住 UI 好。
 			log.debug("live index 未建立，跳过本轮打点", sessionId, `turn=${turnIndex ?? "?"}`);
 			return undefined;
 		}
@@ -606,7 +586,6 @@ export class SessionSnapshots {
 			indexSeq: 0,
 			// 进程重启后 live index 还在盘上（它不随 disposeAll 删除），接着用即可
 			liveIndexReady: existsSync(repo.indexPath),
-			sawTurnDuringBaseline: false,
 		};
 		this.sessions.set(sessionId, rt);
 		return rt;
@@ -785,9 +764,7 @@ function beforeTurn(snapshots: SnapshotEntry[], targetTurn: number): SnapshotEnt
 	const want = targetTurn - 1;
 	for (let i = snapshots.length - 1; i >= 0; i -= 1) {
 		const entry = snapshots[i];
-		// 被污染的基线不能当起点（review BUG G）：它里面已经混进了目标轮的改动，
-		// 拿它做 theirs 会 `diff(baseline, baseline)` 为空 → 报「已撤回」却一字未动。
-		if (entry && !entry.polluted && entry.turnIndex === want) return entry;
+		if (entry && entry.turnIndex === want) return entry;
 	}
 	// 找不到就是超出保留窗口，**不能用基线顶替**：基线条目本身就在数组里（`ensureBaseline` push 了它），
 	// 循环已经覆盖了它。能走到这里的唯一情况是 `want < baseline.turnIndex` —— 目标轮早于会话开始，
