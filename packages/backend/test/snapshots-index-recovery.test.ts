@@ -103,7 +103,6 @@ describe("snapshots：撤回中途抛错后的 index 兜底", () => {
 			cwd,
 			targetTurn: 0,
 			ledgerPaths: ["a.txt"],
-			isExclusiveNow: true,
 		});
 		state.boom = false;
 		expect(failed.status).toBe("unavailable");
