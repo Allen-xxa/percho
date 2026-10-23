@@ -33,6 +33,7 @@
 | 图片附件与历史图资源 | renderer `lib/image-attachment.ts`、`lib/image-fit.ts`、`components/chat/history-image/`、`ImagePreview.tsx` |
 | 错误卡、分类、手动重试 | shared `errors.ts`、`transcript/llm-errors.ts`；renderer `stores/session-retry.ts`、`components/chat/ErrorNote.tsx` |
 | 轮次计时、文件变更、diff 侧栏 | shared `transcript/turn-*`；renderer `components/chat/TurnDiffChip.tsx`、`components/diff/` |
+| 撤回消息时连带回退工作区（影子 git 库、快照、冲突修复包） | backend `session/snapshots.ts`、`session/snapshot-git.ts`；renderer `stores/sessions.ts` 的 `recallMessage` |
 | 工具权限、项目边界、信任 | backend `permissions/`、`project/trust*.ts`、`project/workspace-store.ts` |
 | provider、登录、模型可见性、子代理偏好 | backend `settings/`；shared `model-visibility.ts`；renderer `stores/settings.ts`、`components/settings/providers/` |
 | MCP 配置、状态与重连 | backend `mcp/`、`tools/mcp-inventory.ts`；renderer `stores/mcp.ts`、`components/settings/mcp/` |

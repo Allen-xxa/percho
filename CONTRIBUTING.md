@@ -44,6 +44,10 @@ These are hard-won lessons — please follow them:
 - **i18n**: all user-facing strings go through `useT()` and must be added to **both** the `zh` and `en` dictionaries in `packages/desktop/src/renderer/src/i18n/`.
 - **Zustand selectors must return stable references** (module-level constants for empty values). Inline `?? []` creates a new array every call and causes infinite render loops.
 - **Never commit API keys or secrets.** `models.json` uses environment variable references (`$AI_OPS_API_KEY`); keys live in your shell environment only.
+- **A green `npm run typecheck` in your working tree does not prove a commit is self-contained.** Uncommitted work from another branch can satisfy the type checker while the commit alone fails to compile. Before declaring a commit good, verify it in a clean checkout: `git worktree add --detach /tmp/chk <commit>` and run the checks there.
+- **In a verification worktree, `node_modules/@percho/*` must resolve to that worktree's own `packages/`, not the main checkout's.** Junction them explicitly (`New-Item -ItemType Junction`); pointing at the main checkout silently picks up uncommitted changes and gives a false green.
+- **Never `git reset --hard` after rewriting history or moving HEAD.** It destroys uncommitted work in the tree — including changes that are not yours. Use `git reset --soft` plus `git checkout <ref> -- <specific paths>` instead.
+- **Read `git diff --cached` line by line before committing.** The most common failure is one file containing both your change and someone else's uncommitted change. `git diff --cached --stat` line counts are the quickest tripwire.
 
 ## Architecture pointers
 
