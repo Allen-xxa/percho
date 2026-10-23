@@ -178,7 +178,7 @@ function toRecallCodeOutcome(result: RecallCodeResult): RecallCodeOutcome {
 			status: "reverted",
 			reverted: result.reverted,
 			deleted: result.deleted,
-			skipped: result.skipped,
+			alreadyTarget: result.alreadyTarget,
 		};
 	}
 	if (result.status === "conflict") {
@@ -186,12 +186,12 @@ function toRecallCodeOutcome(result: RecallCodeResult): RecallCodeOutcome {
 			status: "conflict",
 			reverted: [],
 			deleted: [],
-			skipped: [],
+			alreadyTarget: [],
 			conflicts: result.conflicts,
 			repairPatch: result.repairPatch,
 		};
 	}
-	return { status: "unavailable", reverted: [], deleted: [], skipped: [] };
+	return { status: "unavailable", reverted: [], deleted: [], alreadyTarget: [] };
 }
 
 /** SessionManager 磁盘枚举项 → SessionMeta（listSessions/listAllSessions 共用） */

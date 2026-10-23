@@ -76,9 +76,10 @@ export interface RecallCodeSuccess {
 	deleted: string[];
 	/**
 	 * 「已经是目标状态、无需动作」的路径（二进制闸门里当前 blob == theirs 的那些）。
-	 * 用户视角和 `reverted` 一样是「没动」，**不是失败项**。
+	 * 用户视角和 `reverted` 一样是「没动」，**不是失败项**；类别 B（大文件/嵌套仓库/gitignore）
+	 * 是「管不了」，静默跳过、不进这个字段 —— 两者语义相反，故不叫 `skipped`。
 	 */
-	skipped: string[];
+	alreadyTarget: string[];
 	/** 对话侧失败时调用，把工作区拨回撤回前的样子 */
 	rollback: () => Promise<void>;
 	/** 撤回后的工作区快照树（`commitRecall` 直接用它，不必重拍） */
@@ -365,7 +366,7 @@ export class SessionSnapshots {
 					status: "reverted",
 					reverted: [],
 					deleted: [],
-					skipped: [],
+					alreadyTarget: [],
 					rollback: noop,
 					postTreeOid: ours,
 					oursTreeOid: ours,
@@ -415,7 +416,7 @@ export class SessionSnapshots {
 				status: "reverted",
 				reverted,
 				deleted,
-				skipped: [...binGuard.resolved],
+				alreadyTarget: [...binGuard.resolved],
 				rollback: async () => {
 					await checkoutTree(rt.repo, restoredOurs);
 				},

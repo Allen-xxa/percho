@@ -70,7 +70,7 @@ describe("recallMessage：代码与对话一起回退", () => {
 			recalled: true,
 			text: "改一下 a.txt",
 			images: [],
-			code: { status: "reverted", reverted: ["a.txt"], deleted: [], skipped: [] },
+			code: { status: "reverted", reverted: ["a.txt"], deleted: [], alreadyTarget: [] },
 		});
 
 		await useSessionsStore.getState().recallMessage({ entryId: "e1" });
@@ -89,7 +89,7 @@ describe("recallMessage：代码与对话一起回退", () => {
 			recalled: true,
 			text: "删掉临时脚本",
 			images: [],
-			code: { status: "reverted", reverted: [], deleted: ["tmp/a.mjs", "tmp/b.mjs"], skipped: [] },
+			code: { status: "reverted", reverted: [], deleted: ["tmp/a.mjs", "tmp/b.mjs"], alreadyTarget: [] },
 		});
 
 		await useSessionsStore.getState().recallMessage({ entryId: "e1" });
@@ -109,7 +109,7 @@ describe("recallMessage：代码与对话一起回退", () => {
 				status: "conflict",
 				reverted: [],
 				deleted: [],
-				skipped: [],
+				alreadyTarget: [],
 				conflicts: ["a.txt", "b.txt"],
 				repairPatch: patch,
 			},
@@ -137,7 +137,7 @@ describe("recallMessage：代码与对话一起回退", () => {
 			recalled: false,
 			text: "",
 			images: [],
-			code: { status: "unavailable", reverted: [], deleted: [], skipped: [] },
+			code: { status: "unavailable", reverted: [], deleted: [], alreadyTarget: [] },
 		});
 
 		await useSessionsStore.getState().recallMessage({ entryId: "e1" });
@@ -152,7 +152,7 @@ describe("recallMessage：代码与对话一起回退", () => {
 			recalled: false,
 			text: "",
 			images: [],
-			code: { status: "conflict", reverted: [], deleted: [], skipped: [], conflicts: ["a.txt"] },
+			code: { status: "conflict", reverted: [], deleted: [], alreadyTarget: [], conflicts: ["a.txt"] },
 		});
 
 		await useSessionsStore.getState().recallMessage({ entryId: "e1" });

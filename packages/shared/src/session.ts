@@ -265,8 +265,13 @@ export interface RecallCodeOutcome {
 	reverted: string[];
 	/** 被删掉的路径（agent 新建、撤回后不应存在） */
 	deleted: string[];
-	/** 类别 B：静默跳过的路径（大文件/嵌套仓库/已是目标状态），仅调试 */
-	skipped: string[];
+	/**
+	 * 二进制闸门里「当前内容已等于目标内容」的路径：无需动作、也不算失败。
+	 *
+	 * 注意与类别 B（大文件/嵌套仓库/gitignore/项目外）区分 —— 那些是「管不了」，静默跳过、
+	 * 根本不进这个字段。字段名故意不叫 `skipped`，避免两种语义混在一起。
+	 */
+	alreadyTarget: string[];
 	/** 冲突路径（仅 status === "conflict"） */
 	conflicts?: string[];
 	/** 完整 unified patch，粘进输入框让 agent 照着手改（仅 status === "conflict"） */
