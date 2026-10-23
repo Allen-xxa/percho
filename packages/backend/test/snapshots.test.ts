@@ -192,6 +192,55 @@ describe("snapshots：打点与时间线", () => {
 		expect(read("a.txt")).toBe("frozen-at-call\n");
 	});
 
+	it("基线进行中 capture 仍成功：同步冻结走私有 index，不撞 index.lock（BUG F）", async () => {
+		if (!gitOk) return;
+		write("a.txt", "v0\n");
+		await snapshots.ensureBaseline(SID, cwd, -1, true);
+		await snapshots.idle(SID);
+
+		// 模拟「基线的异步 add -A 正握着 live index 的锁」：这是首轮打点必踩的场景
+		// —— 基线首次要 3.2s，这期间第一轮 turn_end 就到了。
+		const liveLock = join(snapDir, `${SID}.index.lock`);
+		writeFileSync(liveLock, "");
+
+		write("a.txt", "turn0\n");
+		const frozen = snapshots.capture(SID, cwd, 0);
+		// 共用 live index 时这里必然是 undefined（fatal: Unable to create '...index.lock': File exists），
+		// 于是第 0 轮永远没快照，之后撤回第 1 轮直接 out-of-window。
+		expect(frozen).toBeDefined();
+
+		rmSync(liveLock, { force: true });
+		await snapshots.record(SID, cwd, 0, true, frozen);
+		await snapshots.idle(SID);
+		expect(snapshots.hasEntry(SID, 0)).toBe(true);
+
+		// 冻结出来的树是对的：撤回第 1 轮必须回到 turn0
+		write("a.txt", "turn1\n");
+		await snapshots.record(SID, cwd, 1, true);
+		await snapshots.idle(SID);
+		const res = await snapshots.recallCode({
+			sessionId: SID,
+			cwd,
+			targetTurn: 1,
+			ledgerPaths: ["a.txt"],
+		});
+		expect(res.status).toBe("reverted");
+		expect(read("a.txt")).toBe("turn0\n");
+	});
+
+	it("hasEntry 反映本轮是否已打过点（agent_settled 兜底前用）", async () => {
+		if (!gitOk) return;
+		write("a.txt", "base\n");
+		await snapshots.ensureBaseline(SID, cwd, -1, true);
+		await snapshots.idle(SID);
+		expect(snapshots.hasEntry(SID, 0)).toBe(false);
+		await snapshots.record(SID, cwd, 0, true);
+		await snapshots.idle(SID);
+		expect(snapshots.hasEntry(SID, 0)).toBe(true);
+		expect(snapshots.hasEntry(SID, 1)).toBe(false);
+		expect(snapshots.hasEntry("no-such-session", 0)).toBe(false);
+	});
+
 	it("元数据落盘后可被新实例读回", async () => {
 		if (!gitOk) return;
 		write("a.txt", "x\n");

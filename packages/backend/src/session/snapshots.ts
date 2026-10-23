@@ -1,3 +1,4 @@
+import { copyFileSync, renameSync, rmSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { join, relative, resolve, sep } from "node:path";
 import { JsonStore } from "../json-store";
@@ -21,6 +22,7 @@ import {
 	runGit,
 	type ShadowRepo,
 	snapshotTree,
+	withIndexFile,
 	writeCapturedTreeSync,
 } from "./snapshot-git";
 
@@ -99,6 +101,8 @@ interface SessionRuntime {
 	tail: Promise<void>;
 	/** 排队中的打点数；`idle` 等它归零 */
 	pending: number;
+	/** 私有 index 文件序号（每次操作一个新文件，避免撞 `index.lock`） */
+	indexSeq: number;
 }
 
 const noop = async (): Promise<void> => {};
@@ -157,7 +161,9 @@ export class SessionSnapshots {
 			if (rt.state.snapshots.length > 0) return;
 			await this.enqueue(rt, async () => {
 				if (rt.state.snapshots.length > 0) return;
-				const { treeOid, skipped } = await snapshotTree(rt.repo, { skipOverBytes: this.skipOverBytes });
+				const { treeOid, skipped } = await this.withPrivateIndex(rt, (repo) =>
+					snapshotTree(repo, { skipOverBytes: this.skipOverBytes }),
+				);
 				const commit = await this.commitOrNull(rt, treeOid, "baseline", baselineTurnIndex);
 				rt.state.snapshots.push({
 					turnIndex: baselineTurnIndex,
@@ -246,7 +252,7 @@ export class SessionSnapshots {
 	 *
 	 * ⚠️ 阻塞主线程 30ms 量级（增量），见 `snapshot-git.ts` 的 `captureIndex`。
 	 */
-	capture(sessionId: string, cwd: string): CapturedIndex | undefined {
+	capture(sessionId: string, cwd: string, turnIndex?: number): CapturedIndex | undefined {
 		if (!this.gitAvailable) return undefined;
 		const rt = this.sessions.get(sessionId);
 		if (!rt) return undefined;
@@ -254,13 +260,29 @@ export class SessionSnapshots {
 		try {
 			// add -A 与 write-tree 都同步跑完：index 与树一起冻结，之后工作区再变不影响。
 			// write-tree 只是遍历 index 建 tree 对象（blob 已在 add 时落库），开销可忽略。
-			const skipped = captureIndex(rt.repo, { skipOverBytes: this.skipOverBytes });
-			const treeOid = writeCapturedTreeSync(rt.repo);
-			return { treeOid, skipped };
+			// ❗ 必须用私有 index（BUG F）：否则基线还在跑 3.2s 的 add -A 时，
+			// 这里同步 add -A 会撞 index.lock，第一轮快照直接丢失。
+			return this.withPrivateIndexSync(rt, (repo) => {
+				const skipped = captureIndex(repo, { skipOverBytes: this.skipOverBytes });
+				const treeOid = writeCapturedTreeSync(repo);
+				return { treeOid, skipped };
+			});
 		} catch (err) {
-			log.warn("冻结 index 失败（本轮不打点）", sessionId, String(err));
+			// 丢点不该静默：带上 turnIndex，否则线上排查「为什么撤不回」没线索
+			log.warn("冻结 index 失败（本轮不打点）", sessionId, `turn=${turnIndex ?? "?"}`, String(err));
 			return undefined;
 		}
+	}
+
+	/**
+	 * 本轮是否已经有打点条目（`agent_settled` 兜底前用）。
+	 *
+	 * `turn_end` 已经拍过就不必再拍：撞锁时同样会丢点，不撞锁时也是白花 30ms 重拍同一棵树。
+	 */
+	hasEntry(sessionId: string, turnIndex: number): boolean {
+		const rt = this.sessions.get(sessionId);
+		if (!rt) return false;
+		return rt.state.snapshots.some((s) => s.turnIndex === turnIndex);
 	}
 
 	/** 撤回前先等排队清空 */
@@ -297,7 +319,13 @@ export class SessionSnapshots {
 
 		const theirsEntry = beforeTurn(rt.state.snapshots, req.targetTurn);
 		if (!theirsEntry) {
-			// 目标轮之前的快照已被保留窗口裁掉
+			// 目标轮之前的快照已被保留窗口裁掉，或那一轮当时没拍成（冻结失败 / 会话中途才开）
+			log.debug(
+				"目标轮没有快照，无法回退代码",
+				rt.sessionId,
+				`targetTurn=${req.targetTurn}`,
+				`entries=${rt.state.snapshots.map((s) => `${s.kind}@${s.turnIndex}`).join(",")}`,
+			);
 			return { status: "conflict", conflicts: [], repairPatch: "", reason: "out-of-window" };
 		}
 
@@ -312,7 +340,9 @@ export class SessionSnapshots {
 		let wrote = false;
 		try {
 			// 用户可能手改过工作区，必须现拍（不能复用上一次打点的树）
-			ours = (await snapshotTree(rt.repo, { skipOverBytes: this.skipOverBytes })).treeOid;
+			ours = (
+				await this.withPrivateIndex(rt, (repo) => snapshotTree(repo, { skipOverBytes: this.skipOverBytes }))
+			).treeOid;
 
 			// 回退范围按**历史记录**判定：窗口内每一轮打点都独占，才敢整片回退
 			const exclusive = windowIsExclusive(rt.state.snapshots, req.targetTurn);
@@ -460,7 +490,12 @@ export class SessionSnapshots {
 		try {
 			await this.enqueue(rt, async () => {
 				const treeOid =
-					postTreeOid ?? (await snapshotTree(rt.repo, { skipOverBytes: this.skipOverBytes })).treeOid;
+					postTreeOid ??
+					(
+						await this.withPrivateIndex(rt, (repo) =>
+							snapshotTree(repo, { skipOverBytes: this.skipOverBytes }),
+						)
+					).treeOid;
 				const dropped = rt.state.snapshots.filter((s) => s.turnIndex >= targetTurn);
 				rt.state.snapshots = rt.state.snapshots.filter((s) => s.turnIndex < targetTurn);
 				await deleteSnapshots(rt.repo, refsOf(dropped));
@@ -527,7 +562,15 @@ export class SessionSnapshots {
 				? { ...loaded, cwd }
 				: { version: 1, cwd, snapshots: [] };
 
-		const rt: SessionRuntime = { sessionId, repo, metaPath, state, tail: Promise.resolve(), pending: 0 };
+		const rt: SessionRuntime = {
+			sessionId,
+			repo,
+			metaPath,
+			state,
+			tail: Promise.resolve(),
+			pending: 0,
+			indexSeq: 0,
+		};
 		this.sessions.set(sessionId, rt);
 		return rt;
 	}
@@ -541,6 +584,79 @@ export class SessionSnapshots {
 		});
 		this.stores.set(sessionId, store);
 		return store;
+	}
+
+	/**
+	 * 在**私有 index 文件**上跑一段 git 操作（BUG F）。
+	 *
+	 * 同步的 `capture()` 与异步队列若共用同一个 index，会在 `index.lock` 上撞车：
+	 * 基线首次打点要 3.2s，这期间第一轮 `turn_end` 的同步 `add -A` 直接
+	 * `fatal: Unable to create '...idx.lock': File exists` → 该轮快照静默丢失，
+	 * 之后 `beforeTurn` 找不到目标轮 → `out-of-window`。`write-tree` 同样占锁
+	 * （实测异步 write-tree 与同步 add -A 并发 6 次 ok=1 fail=5）。
+	 *
+	 * 做法：复制 live index 到私有文件 → 在私有文件上跑 → 成功后原子前移回 live。
+	 * 前移只为保住「下次仍是增量」（失败不影响正确性，只是下次多重算一些）。
+	 */
+	/** 同步用法（`capture()` 必须在 turn_end 里同步跑完） */
+	private withPrivateIndexSync<T>(rt: SessionRuntime, run: (repo: ShadowRepo) => T): T {
+		const mine = `${rt.repo.indexPath}.${++rt.indexSeq}`;
+		try {
+			copyFileSync(rt.repo.indexPath, mine);
+		} catch {
+			// live index 还不存在（首次）：私有文件从空开始，等价于全新 index
+			try {
+				rmSync(mine, { force: true });
+			} catch {
+				// 忽略
+			}
+		}
+		const value = run(withIndexFile(rt.repo, mine));
+		try {
+			renameSync(mine, rt.repo.indexPath);
+		} catch {
+			try {
+				rmSync(mine, { force: true });
+			} catch {
+				// 忽略
+			}
+		}
+		return value;
+	}
+
+	/** 异步用法（排队里的基线/撤回/重置时间线） */
+	private async withPrivateIndex<T>(rt: SessionRuntime, run: (repo: ShadowRepo) => Promise<T>): Promise<T> {
+		const mine = `${rt.repo.indexPath}.${++rt.indexSeq}`;
+		try {
+			copyFileSync(rt.repo.indexPath, mine);
+		} catch {
+			try {
+				rmSync(mine, { force: true });
+			} catch {
+				// 忽略
+			}
+		}
+		const scoped = withIndexFile(rt.repo, mine);
+		try {
+			const value = await run(scoped);
+			try {
+				renameSync(mine, rt.repo.indexPath);
+			} catch {
+				try {
+					rmSync(mine, { force: true });
+				} catch {
+					// 忽略
+				}
+			}
+			return value;
+		} catch (err) {
+			try {
+				rmSync(mine, { force: true });
+			} catch {
+				// 忽略
+			}
+			throw err;
+		}
 	}
 
 	/** 链式排队：同一会话的打点按入队顺序执行 */

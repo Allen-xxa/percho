@@ -772,19 +772,22 @@ export class PiBackend {
 		// 两轮拍成同一棵树 → 撤回静默空转。
 		const snap = (frozen?: CapturedIndex): void => {
 			if (session.isCompacting) return;
-			void this.snapshots.record(sessionId, cwd, turnIndexOf(), this.isExclusiveCwd(cwd, sessionId), frozen);
+			const turnIndex = turnIndexOf();
+			void this.snapshots.record(sessionId, cwd, turnIndex, this.isExclusiveCwd(cwd, sessionId), frozen);
 		};
 		const unsubscribe = session.subscribe((event) => {
 			if (event.type === "turn_end") {
 				// ❗ 不要判 `event.aborted`：那是 agent_settled 的字段，turn_end 里没有。
 				// abort 前已完成的轮次是真实改动，仍要打点。
 				// 也不判 isStreaming：turn_end 时它本来就是 true（agent_settled 才是 false）。
-				snap(this.snapshots.capture(sessionId, cwd));
+				snap(this.snapshots.capture(sessionId, cwd, turnIndexOf()));
 				return;
 			}
 			if (event.type !== "agent_settled") return;
-			// settled 只兜底（同 turnIndex 会被覆盖，代价只是一次 add -A）
+			// settled 只兜底：turn_end 已经拍过本轮就不必再拍（撞锁时同样丢点，
+			// 不撞锁时也是白花 30ms 重拍同一棵树）。
 			if (session.isStreaming) return;
+			if (this.snapshots.hasEntry(sessionId, turnIndexOf())) return;
 			snap();
 		});
 		const entry = this.registry.get(sessionId);
