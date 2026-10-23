@@ -242,80 +242,101 @@ export class SessionSnapshots {
 		const base = last.treeOid;
 		const theirs = theirsEntry.treeOid;
 
-		// 用户可能手改过工作区，必须现拍（不能复用上一次打点的树）
-		const ours = (await snapshotTree(rt.repo, { skipOverBytes: this.skipOverBytes })).treeOid;
+		// ❗ 这条链会反复改写 index（snapshotTree 的 add -A → buildFilteredTree 的 read-tree base
+		// → resetIndexTo(ours) → checkoutTree 的 read-tree -u merged）。任何一步抛错，index 都会停在
+		// 半路（既不是 base 也不是 ours），下一次打点的 `add -A` 就会算错增量。
+		// 所以：只要没成功写盘，finally 无条件把 index 拨回 ours。
+		let ours: string | null = null;
+		let wrote = false;
+		try {
+			// 用户可能手改过工作区，必须现拍（不能复用上一次打点的树）
+			ours = (await snapshotTree(rt.repo, { skipOverBytes: this.skipOverBytes })).treeOid;
 
-		// 回退范围按**历史记录**判定：窗口内每一轮打点都独占，才敢整片回退
-		const exclusive = windowIsExclusive(rt.state.snapshots, req.targetTurn);
-		const changed = await diffPaths(rt.repo, base, theirs);
-		const ledger = normalizeLedgerPaths(req.cwd, req.ledgerPaths);
-		let scope = exclusive ? changed : changed.filter((p) => ledger.has(p));
-		if (scope.length === 0) {
+			// 回退范围按**历史记录**判定：窗口内每一轮打点都独占，才敢整片回退
+			const exclusive = windowIsExclusive(rt.state.snapshots, req.targetTurn);
+			const changed = await diffPaths(rt.repo, base, theirs);
+			const ledger = normalizeLedgerPaths(req.cwd, req.ledgerPaths);
+			let scope = exclusive ? changed : changed.filter((p) => ledger.has(p));
+			if (scope.length === 0) {
+				return {
+					status: "reverted",
+					reverted: [],
+					deleted: [],
+					skipped: [],
+					rollback: noop,
+					postTreeOid: ours,
+					oursTreeOid: ours,
+				};
+			}
+
+			// 二进制闸门：git 只看前 8000 字节判二进制，靠后的 NUL 会被静默行级合并成半坏文件
+			const binGuard = await this.binaryGuard(rt.repo, base, theirs, ours, scope);
+			if (binGuard.conflicts.length > 0) {
+				return {
+					status: "conflict",
+					conflicts: binGuard.conflicts,
+					repairPatch: await diffPatch(rt.repo, base, theirs),
+					reason: "merge",
+				};
+			}
+			// 已经和目标状态一致的二进制不需要参与合并（写回也是同样的字节）
+			scope = scope.filter((p) => !binGuard.resolved.has(p));
+
+			// 缩窄 theirs：只保留 scope 内的路径，窗口外的路径保持工作区原样
+			const filteredTheirs = await buildFilteredTree(rt.repo, base, theirs, scope);
+			// merge-tree 前 index 必须停在 ours 树上
+			await resetIndexTo(rt.repo, ours);
+			const merged = await mergeTrees(rt.repo, { base, ours, theirs: filteredTheirs });
+			// ❗ failed 必须在 conflicts 之前判：否则「基础设施失败」会被当成「无冲突」继续往下走
+			if (merged.failed) return { status: "unavailable", reason: "merge-failed" };
+			if (merged.conflicts.length > 0) {
+				// 此时还没写盘，工作区一个字节都没动
+				return {
+					status: "conflict",
+					conflicts: merged.conflicts,
+					repairPatch: await diffPatch(rt.repo, base, theirs),
+					reason: "merge",
+				};
+			}
+
+			await checkoutTree(rt.repo, merged.treeOid);
+			wrote = true;
+
+			const changedNow = await diffPaths(rt.repo, ours, merged.treeOid);
+			const inMerged = await listTree(rt.repo, merged.treeOid);
+			const reverted = changedNow.filter((p) => inMerged.has(p));
+			const deleted = changedNow.filter((p) => !inMerged.has(p));
+			const restoredOurs = ours;
+
 			return {
 				status: "reverted",
-				reverted: [],
-				deleted: [],
-				skipped: [],
-				rollback: noop,
-				postTreeOid: ours,
-				oursTreeOid: ours,
+				reverted,
+				deleted,
+				skipped: [...binGuard.resolved],
+				rollback: async () => {
+					await checkoutTree(rt.repo, restoredOurs);
+				},
+				postTreeOid: merged.treeOid,
+				oursTreeOid: restoredOurs,
 			};
+		} finally {
+			if (!wrote) {
+				// 没写盘 = 工作区还是 ours 的样子，index 必须与之一致（拍不出 ours 时退化成 last.treeOid）
+				const target = ours ?? last.treeOid;
+				await resetIndexTo(rt.repo, target).catch((err: unknown) => {
+					log.warn("恢复 index 失败（下次打点可能算错增量）", rt.sessionId, String(err));
+				});
+			}
 		}
-
-		// 二进制闸门：git 只看前 8000 字节判二进制，靠后的 NUL 会被静默行级合并成半坏文件
-		const binGuard = await this.binaryGuard(rt.repo, base, theirs, ours, scope);
-		if (binGuard.conflicts.length > 0) {
-			return {
-				status: "conflict",
-				conflicts: binGuard.conflicts,
-				repairPatch: await diffPatch(rt.repo, base, theirs),
-				reason: "merge",
-			};
-		}
-		scope = scope.filter((p) => !binGuard.skip.has(p));
-
-		// 缩窄 theirs：只保留 scope 内的路径，窗口外的路径保持工作区原样
-		const filteredTheirs = await buildFilteredTree(rt.repo, base, theirs, scope);
-		// merge-tree 前 index 必须停在 ours 树上
-		await resetIndexTo(rt.repo, ours);
-		const merged = await mergeTrees(rt.repo, { base, ours, theirs: filteredTheirs });
-		if (merged.failed) return { status: "unavailable", reason: "merge-failed" };
-		if (merged.conflicts.length > 0) {
-			// 此时还没写盘，工作区一个字节都没动
-			return {
-				status: "conflict",
-				conflicts: merged.conflicts,
-				repairPatch: await diffPatch(rt.repo, base, theirs),
-				reason: "merge",
-			};
-		}
-
-		await checkoutTree(rt.repo, merged.treeOid);
-
-		const changedNow = await diffPaths(rt.repo, ours, merged.treeOid);
-		const inMerged = await listTree(rt.repo, merged.treeOid);
-		const reverted = changedNow.filter((p) => inMerged.has(p));
-		const deleted = changedNow.filter((p) => !inMerged.has(p));
-
-		return {
-			status: "reverted",
-			reverted,
-			deleted,
-			skipped: [...binGuard.skip],
-			rollback: async () => {
-				await checkoutTree(rt.repo, ours);
-			},
-			postTreeOid: merged.treeOid,
-			oursTreeOid: ours,
-		};
 	}
 
 	/**
-	 * 二进制闸门（plan §2 步骤 7b）。
+	 * 二进制闸门（plan §2 步骤 7b，review 2026-10-23 23:12 改成三方判定）。
 	 *
-	 * - 当前 blob 与 theirs 的 blob 相同 → 无冲突风险，交给正常合并写回（放进 `skip` 没必要，
-	 *   这里不动 scope，合并结果就是 theirs）
-	 * - 当前 blob ≠ theirs 且 ≠ base → 二进制无"部分回退"，**直接判类别 A 冲突**
+	 * - 当前 blob == theirs  → `resolved`：已经是目标状态，从 scope 移除
+	 * - 当前 blob == base    → 留在 scope 交给 merge-tree（ours === base 时直接取 theirs，干净不冲突）。
+	 *   ❗ 这是**最正常**的情况：窗口内被 agent 改过、之后没人动过，当前内容本就该是 base。
+	 * - 都不是               → 真的被人动过，二进制没法按行合并，判类别 A 冲突
 	 */
 	private async binaryGuard(
 		repo: ShadowRepo,
@@ -323,10 +344,10 @@ export class SessionSnapshots {
 		theirs: string,
 		ours: string,
 		scope: string[],
-	): Promise<{ conflicts: string[]; skip: Set<string> }> {
+	): Promise<{ conflicts: string[]; resolved: Set<string> }> {
 		const bins = await detectBinaryPaths(repo, { fromTree: base, oursTree: ours, paths: scope });
-		const skip = new Set<string>();
-		if (bins.size === 0) return { conflicts: [], skip };
+		const resolved = new Set<string>();
+		if (bins.size === 0) return { conflicts: [], resolved };
 
 		const [baseTree, theirsTree, oursTree] = await Promise.all([
 			listTree(repo, base),
@@ -337,17 +358,15 @@ export class SessionSnapshots {
 		for (const path of bins) {
 			const oursSha = oursTree.get(path)?.sha ?? "";
 			const theirsSha = theirsTree.get(path)?.sha ?? "";
-			if (oursSha === theirsSha) continue; // 已经和目标一致，无需处理
-			const baseSha = baseTree.get(path)?.sha ?? "";
-			if (oursSha === baseSha) {
-				// 用户没动过这个二进制 → 安全回退（合并会取 theirs）
+			if (oursSha === theirsSha) {
+				resolved.add(path);
 				continue;
 			}
-			// 用户（或窗口外的会话）改过它 → 二进制没法按行合并，判冲突
+			const baseSha = baseTree.get(path)?.sha ?? "";
+			if (oursSha === baseSha) continue;
 			conflicts.push(path);
 		}
-		if (conflicts.length > 0) skip.clear();
-		return { conflicts, skip };
+		return { conflicts, resolved };
 	}
 
 	/**

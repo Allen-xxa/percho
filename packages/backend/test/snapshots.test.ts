@@ -267,6 +267,99 @@ describe("snapshots：撤回", () => {
 		expect(md5(readFileSync(join(cwd, "img.png")))).toBe(before);
 	});
 
+	it("二进制当前内容 == base（agent 改过、之后没人动）→ 正常回退，不判冲突", async () => {
+		if (!gitOk) return;
+		const png = (fill: number): Buffer => {
+			const b = Buffer.alloc(200, fill);
+			b[0] = 0x89;
+			b[1] = 0x50;
+			b[2] = 0x4e;
+			b[3] = 0x47;
+			b[10] = 0;
+			return b;
+		};
+		// 基线：img.png 是 png(65)；第 0 轮 agent 把它改成 png(66) 并存进 base
+		writeFileSync(join(cwd, "img.png"), png(65));
+		await snapshots.disposeSession(SID);
+		await snapshots.ensureBaseline(SID, cwd, -1, true);
+		await snapshots.idle(SID);
+		writeFileSync(join(cwd, "img.png"), png(66));
+		await snapshots.record(SID, cwd, 0, true);
+		await snapshots.idle(SID);
+
+		// 撤回第 0 轮：当前（= base）既不是 theirs 也不是... 等等，它**是** base。
+		// review 的三方判定：ours == base → 留在 scope 交给 merge-tree，不判冲突。
+		const res = await snapshots.recallCode({
+			sessionId: SID,
+			cwd,
+			targetTurn: 0,
+			ledgerPaths: ["img.png"],
+			isExclusiveNow: true,
+		});
+		expect(res.status).toBe("reverted");
+		if (res.status !== "reverted") return;
+		// 回到基线那份 png(65)
+		expect(md5(readFileSync(join(cwd, "img.png")))).toBe(md5(png(65)));
+	});
+
+	it("撤回失败（冲突）后 index 被拨回 ours：下一次打点仍能算对增量", async () => {
+		if (!gitOk) return;
+		await round(0, { "a.txt": "agent changed\n" });
+		write("a.txt", "user changed\n");
+		const oursTree = (
+			await rawGit(null, ["--git-dir", join(snapDir, `${SID}.git`), "rev-parse", "refs/snap/turn-0"])
+		).stdout.trim();
+		const indexPath = join(snapDir, `${SID}.index`);
+
+		const res = await snapshots.recallCode({
+			sessionId: SID,
+			cwd,
+			targetTurn: 0,
+			ledgerPaths: ["a.txt"],
+			isExclusiveNow: true,
+		});
+		expect(res.status).toBe("conflict");
+
+		// ❗ 直接钉住 index：冲突路径上 index 必须与工作区（= 刚拍的 ours）对齐。
+		// 这行断言是「没有 finally 就红」的那一条 —— 去掉 finally 后 index 会停在
+		// buildFilteredTree 留下的 base 树上，下面的 `ls-files -s` 会给出基线的 blob。
+		const sh = { gitDir: join(snapDir, `${SID}.git`), workTree: cwd, indexPath };
+		const lsFiles = await rawGit(sh, ["ls-files", "-s", "a.txt"]);
+		const indexBlob = lsFiles.stdout.trim().split(/\s+/)[1] ?? "";
+		// ours 树是撤回时现拍的（含用户手改），没有被 ref 引用，所以直接算磁盘字节的 blob。
+		// ❗ 必须带 sh（影子库环境）：不带时 cwd 落在本仓库，`* text=auto` 会把 CRLF 归一化，
+		// 算出来的 blob 与影子库里的对不上（实测 40ed9b0b… vs dab4bd46…）。
+		const expectedBlob = (
+			await rawGit(sh, ["hash-object", "--stdin"], {
+				input: "user changed\n",
+			})
+		).stdout.trim();
+		expect(indexBlob).toBe(expectedBlob);
+		expect(oursTree).toMatch(/^[0-9a-f]{40,64}$/);
+
+		// 冲突后工作区没变（还是 user changed），index 也应与之对齐。
+		// 接着写一个新文件再打点：如果 index 停在半路，这里会算出错误的 tree。
+		write("b.txt", "new file\n");
+		await snapshots.record(SID, cwd, 1, true);
+		await snapshots.idle(SID);
+
+		const entries = snapshots.entriesOf(SID);
+		expect(entries.map((e) => e.turnIndex)).toEqual([-1, 0, 1]);
+		// 撤回一轮之后的新打点，必须能撤回回它自己的前一点
+		const again = await snapshots.recallCode({
+			sessionId: SID,
+			cwd,
+			targetTurn: 1,
+			ledgerPaths: ["b.txt"],
+			isExclusiveNow: true,
+		});
+		expect(again.status).toBe("reverted");
+		expect(existsSync(join(cwd, "b.txt"))).toBe(false);
+		// 撤回到「第 1 轮开始前」= 第 0 轮结束时的树（agent changed）。
+		// 用户在两轮之间手改的 "user changed" 已被并进第 1 轮快照，所以随第 1 轮一起被撤掉。
+		expect(read("a.txt")).toBe("agent changed\n");
+	});
+
 	it("非独占窗口 + 不在账本里的路径 → 静默跳过", async () => {
 		if (!gitOk) return;
 		// 第 0 轮不独占：另一会话可能同时改过工作区
