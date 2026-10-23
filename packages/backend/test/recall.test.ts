@@ -185,7 +185,9 @@ describe("PiBackend.recallMessage 悬挂分支（绕过 navigateTree，走官方
 		const refreshContext = vi.fn();
 		const backend = makeBackend(sm, refreshContext);
 
-		await expect(backend.recallMessage("s1", { entryId: dangling })).resolves.toEqual({
+		// code 在无快照能力的会话里是 unavailable（降级为只撤对话），这里只关心对话那一半
+		await expect(backend.recallMessage("s1", { entryId: dangling })).resolves.toMatchObject({
+			recalled: true,
 			text: "b",
 			images: [],
 		});

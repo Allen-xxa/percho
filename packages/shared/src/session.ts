@@ -253,6 +253,26 @@ export interface ImageInput {
 	mimeType: string;
 }
 
+/**
+ * 撤回时「代码那一半」的结果（spec 6.3）。
+ * - `reverted`：工作区真的被倒回去了
+ * - `conflict`：类别 A 冲突，**工作区一个字节都没动**，`repairPatch` 是给人/agent 照着手改的修复包
+ * - `unavailable`：git 不可用/没快照/内部失败 —— 降级为「只撤对话」，不提示（spec 第 4 节：不制造噪音）
+ */
+export interface RecallCodeOutcome {
+	status: "reverted" | "conflict" | "unavailable";
+	/** 被改回快照内容的路径（相对 cwd，posix 分隔） */
+	reverted: string[];
+	/** 被删掉的路径（agent 新建、撤回后不应存在） */
+	deleted: string[];
+	/** 类别 B：静默跳过的路径（大文件/嵌套仓库/已是目标状态），仅调试 */
+	skipped: string[];
+	/** 冲突路径（仅 status === "conflict"） */
+	conflicts?: string[];
+	/** 完整 unified patch，粘进输入框让 agent 照着手改（仅 status === "conflict"） */
+	repairPatch?: string;
+}
+
 /** 斜杠命令来源 */
 export type SlashCommandSource = "builtin" | "template" | "skill" | "extension";
 

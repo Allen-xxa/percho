@@ -28,6 +28,7 @@ import type {
 	PermissionResolved,
 	QueuedMessages,
 	QuotaInfo,
+	RecallCodeOutcome,
 	SessionCloseIntent,
 	SessionEventEnvelope,
 	SessionMessage,
@@ -141,10 +142,18 @@ export const SESSION_CHANNELS = {
 		{ sessionId: string; ref: { entryId?: string; text?: string } },
 		SessionMeta
 	>(),
-	/** 撤回用户消息（回退到该消息之前，内容放回输入框） */
+	/** 撤回用户消息（回退到该消息之前，内容放回输入框；代码一并倒回目标轮） */
 	recallMessage: ch("session:recall")<
 		{ sessionId: string; ref: { entryId?: string; text?: string; timestamp?: number } },
-		{ text: string; images: ImageInput[]; document?: ComposerDocument }
+		{
+			/** 对话是否被撤回；false = 代码冲突，两边都未动 */
+			recalled: boolean;
+			text: string;
+			images: ImageInput[];
+			document?: ComposerDocument;
+			/** 代码那一半的结果；undefined = 该会话没有快照能力（旧客户端） */
+			code?: RecallCodeOutcome;
+		}
 	>(),
 	/** 读取会话已加载的资源（skills/扩展；设置页展示用） */
 	getLoadedResources: ch("session:getLoadedResources")<{ sessionId: string }, LoadedResources>(),

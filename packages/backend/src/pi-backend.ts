@@ -47,6 +47,7 @@ import type {
 	PermissionRequest,
 	PermissionResolved,
 	QuotaInfo,
+	RecallCodeOutcome,
 	SessionCloseIntent,
 	SessionEvent,
 	SessionMessage,
@@ -61,9 +62,11 @@ import {
 	type ComposerDocument,
 	composerDocumentFromText,
 	composerDocumentText,
+	deriveTurnChanges,
 	extractTodos,
 	formatSkillCommand,
 	isModelVisible,
+	messagesToUIMessages,
 	parseExpandedSkillInvocation,
 	type QueuedMessages,
 	readComposerDocument,
@@ -116,6 +119,7 @@ import {
 import { renameSessionFile } from "./session/rename";
 import { emitSessionShutdown } from "./session/shutdown";
 import { KeyedSingleFlight } from "./session/single-flight";
+import { type RecallCodeResult, SessionSnapshots } from "./session/snapshots";
 import { StreamGuard } from "./session/stream-guard";
 import { TraceRecorder } from "./session/trace";
 import { SessionTraces } from "./session/traces";
@@ -146,6 +150,44 @@ import { makeTodoReminderExtension } from "./tools/todo-reminder";
 import { makeWebFetchTool } from "./tools/webfetch";
 
 const log = createLogger("backend");
+
+/** 分支里的用户轮次数（与 `deriveTurnChanges` 同一口径：user 消息为界） */
+function countUserTurns(branch: readonly SessionEntry[]): number {
+	let count = 0;
+	for (const entry of branch) {
+		if (entry.type === "message" && entry.message.role === "user") count += 1;
+	}
+	return count;
+}
+
+/** 目标 user 条目是第几轮（0 基）；找不到返回 -1 */
+function userTurnIndexOf(branch: readonly SessionEntry[], entryId: string): number {
+	let turn = -1;
+	for (const entry of branch) {
+		if (entry.type !== "message" || entry.message.role !== "user") continue;
+		turn += 1;
+		if (entry.id === entryId) return turn;
+	}
+	return -1;
+}
+
+/** `SessionSnapshots` 的结果 → IPC 契约（去掉不可序列化的 `rollback` 与内部树 id） */
+function toRecallCodeOutcome(result: RecallCodeResult): RecallCodeOutcome {
+	if (result.status === "reverted") {
+		return { status: "reverted", reverted: result.reverted, deleted: result.deleted, skipped: result.skipped };
+	}
+	if (result.status === "conflict") {
+		return {
+			status: "conflict",
+			reverted: [],
+			deleted: [],
+			skipped: [],
+			conflicts: result.conflicts,
+			repairPatch: result.repairPatch,
+		};
+	}
+	return { status: "unavailable", reverted: [], deleted: [], skipped: [] };
+}
 
 /** SessionManager 磁盘枚举项 → SessionMeta（listSessions/listAllSessions 共用） */
 function sessionInfoToMeta(
@@ -196,6 +238,11 @@ export interface PiBackendOptions {
 	 * 目前是 MCP 的 OAuth 授权页（spec §4.2）。缺省 → 官方内置扩展自行回落到平台默认浏览器。
 	 */
 	openExternal?: (url: string) => void | Promise<void>;
+	/**
+	 * 工作区快照目录（撤回时把代码也倒回去）。缺省 `<agentDir>/snap`；
+	 * 桌面端传 `<userData>/snap`。git 不可用时整个能力静默降级。
+	 */
+	snapshotsDir?: string;
 }
 
 /**
@@ -278,8 +325,13 @@ export class PiBackend {
 	});
 	/** 项目资源两阶段加载 + 信任决策 */
 	private readonly projectLoader: ProjectResourceLoader;
+	/** 每会话的工作区快照（撤回 = 对话 + 代码）；git 不可用时内部静默降级 */
+	private readonly snapshots: SessionSnapshots;
+	/** 会话 → 快照打点的 unsubscribe（只卸订阅，不删影子库：会话可能只是被 GC 卸载） */
+	private readonly snapshotUnsubs = new WeakMap<RegisteredSession, () => void>();
 
 	constructor(private readonly options: PiBackendOptions = {}) {
+		this.snapshots = new SessionSnapshots({ dir: options.snapshotsDir ?? join(getAgentDir(), "snap") });
 		this.packages = new PackageAdmin({
 			reloadIdleSessions: () => this.reloadIdleSessions(undefined),
 			defaultCwd: options.defaultCwd,
@@ -529,7 +581,7 @@ export class PiBackend {
 	}
 
 	async init(): Promise<void> {
-		await this.getModelRuntime();
+		await Promise.all([this.getModelRuntime(), this.snapshots.init()]);
 	}
 
 	/** 项目文件列表（@ 补全数据源，相对路径、目录带尾 /，TTL 缓存） */
@@ -691,7 +743,36 @@ export class PiBackend {
 			throw error;
 		}
 		if (!readOnly) await this.traces.start(session.sessionId, session.sessionManager.getSessionDir());
+		// 工作区快照：建基线 + 每轮打点（只读会话不拍）。整个能力不抛错：快照失败不能拖垮会话。
+		if (!readOnly) this.attachSnapshots(session, cwd);
 		return session;
+	}
+
+	/**
+	 * 工作区快照接线（spec 6.2）：基线 = 当前已完成的用户轮次，之后每次 `agent_settled` 打一个点。
+	 *
+	 * ❗ 打点条件（阶段 0 冒烟实测）：一次 run 只发一次 `agent_settled`，但**中断的 run 也发**
+	 * （`aborted === true`），那种情况工作区停在半路，不能当成一轮的成果拍进去。
+	 */
+	private attachSnapshots(session: AgentSession, cwd: string): void {
+		const sessionId = session.sessionId;
+		const turnIndexOf = (): number => countUserTurns(session.sessionManager.getBranch()) - 1;
+		void this.snapshots.ensureBaseline(sessionId, cwd, turnIndexOf(), this.isExclusiveCwd(cwd, sessionId));
+		const unsubscribe = session.subscribe((event) => {
+			if (event.type !== "agent_settled" || event.aborted) return;
+			if (session.isStreaming || session.isCompacting) return;
+			void this.snapshots.record(sessionId, cwd, turnIndexOf(), this.isExclusiveCwd(cwd, sessionId));
+		});
+		const entry = this.registry.get(sessionId);
+		if (entry) this.snapshotUnsubs.set(entry, unsubscribe);
+		else unsubscribe();
+	}
+
+	/** 打点时刻同 cwd 没有其他活跃可写会话（快照窗口内可整片回退） */
+	private isExclusiveCwd(cwd: string, selfId: string): boolean {
+		return !this.registry
+			.list()
+			.some((e) => !e.readOnly && e.cwd === cwd && e.session.sessionId !== selfId);
 	}
 
 	async listSessions(cwd?: string): Promise<SessionMeta[]> {
@@ -781,6 +862,13 @@ export class PiBackend {
 	private beforeSessionShutdown(entry: RegisteredSession): void {
 		const id = entry.session.sessionId;
 		const failures: unknown[] = [];
+		try {
+			// 只卸订阅：会话可能只是被 GC 卸载，之后还会重开，影子库要留着
+			this.snapshotUnsubs.get(entry)?.();
+			this.snapshotUnsubs.delete(entry);
+		} catch (error) {
+			failures.push(error);
+		}
 		try {
 			this.guardTriggerMarkers.clear(id);
 		} catch (error) {
@@ -899,6 +987,10 @@ export class PiBackend {
 			if (error.code !== "ENOENT") throw error;
 		});
 		if (sessionDir) await TraceRecorder.removeAll(sessionDir, sessionId);
+		// 会话真的被删了（不是卸载）：影子库 + index + 元数据一起清
+		await this.snapshots.disposeSession(sessionId).catch((error: unknown) => {
+			log.warn("清理会话快照失败", sessionId, error);
+		});
 		this.channelSubs.delete(sessionId);
 		log.info("session deleted", sessionId);
 	}
@@ -1325,7 +1417,13 @@ export class PiBackend {
 	async recallMessage(
 		sessionId: string,
 		ref: { entryId?: string; text?: string; timestamp?: number },
-	): Promise<{ text: string; images: ImageInput[]; document?: ComposerDocument }> {
+	): Promise<{
+		recalled: boolean;
+		text: string;
+		images: ImageInput[];
+		document?: ComposerDocument;
+		code?: RecallCodeOutcome;
+	}> {
 		const entry = this.requireWritable(sessionId);
 		if (entry.session.isStreaming || entry.session.isCompacting) {
 			throw new Error("Cannot recall while the agent is running or context is compacting");
@@ -1344,27 +1442,91 @@ export class PiBackend {
 				? formatSkillCommand(invocation)
 				: sourceText;
 		const images = blockImages(message.content);
-		if (sm.getLeafId() === targetId) {
-			// 悬挂的用户消息（发出后无任何回复，entry 即当前 leaf）：navigateTree 视为 no-op，
-			// 手动回退 leaf。
-			// 1.0.4 起不要再手写 `agent.state.messages = sm.buildSessionContext().messages`：
-			// 请求上下文由 SessionManager 投影在 prepareRequest 里逐次重建（SDK 内部 _refreshFinalizedContext 收尾）。
-			if (target.parentId) sm.branch(target.parentId);
-			else sm.resetLeaf();
-			// 但这条分支绕过了 navigateTree 的收尾（navigateTree 末尾会 _refreshFinalizedContext），
-			// 不刷新会让 session.messages（= agent.state.messages）停在撤回前：下一轮 prompt 的
-			// compaction 判定（_findLastAssistantMessage）与 UI 的 messageCount 会读到幽灵消息。
-			// 用官方公开原语刷新（与 navigateTree 内部同一件事）。
-			entry.session.refreshContext();
-		} else {
-			const result = await entry.session.navigateTree(targetId);
-			if (result.cancelled) throw new Error("Recall was cancelled by an extension");
+
+		// ── 代码那一半（spec 6.3）：先算完合并树、必要时写盘，再动对话 ──
+		const targetTurn = userTurnIndexOf(sm.getBranch(), targetId);
+		const code = await this.recallCodeHalf(sessionId, entry.cwd, sm, targetTurn);
+		if (code?.status === "conflict") {
+			// 类别 A：整体取消 —— 对话和文件都保持原样（此时还没写盘）
+			return { recalled: false, text: "", images: [], code: toRecallCodeOutcome(code) };
+		}
+
+		try {
+			if (sm.getLeafId() === targetId) {
+				// 悬挂的用户消息（发出后无任何回复，entry 即当前 leaf）：navigateTree 视为 no-op，
+				// 手动回退 leaf。
+				// 1.0.4 起不要再手写 `agent.state.messages = sm.buildSessionContext().messages`：
+				// 请求上下文由 SessionManager 投影在 prepareRequest 里逐次重建（SDK 内部 _refreshFinalizedContext 收尾）。
+				if (target.parentId) sm.branch(target.parentId);
+				else sm.resetLeaf();
+				// 但这条分支绕过了 navigateTree 的收尾（navigateTree 末尾会 _refreshFinalizedContext），
+				// 不刷新会让 session.messages（= agent.state.messages）停在撤回前：下一轮 prompt 的
+				// compaction 判定（_findLastAssistantMessage）与 UI 的 messageCount 会读到幽灵消息。
+				// 用官方公开原语刷新（与 navigateTree 内部同一件事）。
+				entry.session.refreshContext();
+			} else {
+				const result = await entry.session.navigateTree(targetId);
+				if (result.cancelled) throw new Error("Recall was cancelled by an extension");
+			}
+		} catch (error) {
+			// 对话侧失败：代码已经撤了，必须拨回去 —— 否则用户看到「对话没撤、代码撤了」
+			if (code?.status === "reverted") await code.rollback().catch(() => {});
+			throw error;
 		}
 		// 持久化回退点：custom entry 不参与 LLM 上下文，只把 leaf 移动写进文件
 		// （否则撤回只存在内存，重启后旧分支回来）
 		sm.appendCustomEntry(PiBackend.RECALLED_MARKER_TYPE, { recalledEntryId: targetId });
-		log.info("recall message", sessionId, { targetId });
-		return { text, images, ...(document ? { document } : {}) };
+		// 时间线重置：目标轮及之后的快照作废，以撤回后的现场作为新的「第 targetTurn-1 轮」
+		if (code?.status === "reverted") {
+			await this.snapshots.commitRecall(
+				sessionId,
+				entry.cwd,
+				targetTurn,
+				code.postTreeOid,
+				this.isExclusiveCwd(entry.cwd, sessionId),
+			);
+		}
+		log.info("recall message", sessionId, { targetId, targetTurn, code: code?.status });
+		return {
+			recalled: true,
+			text,
+			images,
+			...(document ? { document } : {}),
+			...(code ? { code: toRecallCodeOutcome(code) } : {}),
+		};
+	}
+
+	/**
+	 * 撤回的代码那一半：算出窗口内本轮改过的路径当账本，交给 `SessionSnapshots` 三路合并。
+	 * 任何失败都降级成 `unavailable`（只撤对话），绝不阻断撤回。
+	 */
+	private async recallCodeHalf(
+		sessionId: string,
+		cwd: string,
+		sm: SessionManager,
+		targetTurn: number,
+	): Promise<RecallCodeResult | undefined> {
+		try {
+			const ui = messagesToUIMessages(toBranchSessionMessages(sm.getBranch()));
+			const ledgerPaths = [
+				...new Set(
+					deriveTurnChanges(ui)
+						.filter((turn) => turn.turnIndex >= targetTurn)
+						.flatMap((turn) => turn.files.map((file) => file.path)),
+				),
+			];
+			const result = await this.snapshots.recallCode({
+				sessionId,
+				cwd,
+				targetTurn,
+				ledgerPaths,
+				isExclusiveNow: this.isExclusiveCwd(cwd, sessionId),
+			});
+			return result;
+		} catch (error) {
+			log.warn("撤回代码失败（降级为只撤对话）", sessionId, error);
+			return { status: "unavailable", reason: "internal" };
+		}
 	}
 
 	async listModels(): Promise<AvailableModel[]> {
@@ -1788,6 +1950,7 @@ export class PiBackend {
 		this.extensionEditorTextEmitter.clear();
 		this.trustGate.dispose();
 		this.traces.disposeAll();
+		void this.snapshots.disposeAll();
 		log.info("backend disposed");
 	}
 

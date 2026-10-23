@@ -94,7 +94,9 @@ describe("PiBackend skill recall", () => {
 			cwd: "/tmp",
 		});
 
-		await expect(backend.recallMessage("s1", { entryId })).resolves.toEqual({
+		// code 在无快照能力的会话里是 unavailable（降级为只撤对话），这里只关心对话那一半
+		await expect(backend.recallMessage("s1", { entryId })).resolves.toMatchObject({
+			recalled: true,
 			text: "/skill:mindmap layout",
 			images: [],
 		});

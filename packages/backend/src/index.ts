@@ -81,6 +81,11 @@ export {
 	toSessionMessages,
 } from "./session/messages";
 export { type RegisteredSession, SessionRegistry } from "./session/registry";
+export {
+	type RecallCodeResult,
+	SessionSnapshots,
+	type SnapshotEntry,
+} from "./session/snapshots";
 export { TraceRecorder } from "./session/trace";
 export { LoginService, type LoginServiceDeps } from "./settings/login";
 export { ModelPrefsService } from "./settings/model-prefs";
