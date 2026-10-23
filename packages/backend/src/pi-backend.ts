@@ -174,7 +174,12 @@ function userTurnIndexOf(branch: readonly SessionEntry[], entryId: string): numb
 /** `SessionSnapshots` 的结果 → IPC 契约（去掉不可序列化的 `rollback` 与内部树 id） */
 function toRecallCodeOutcome(result: RecallCodeResult): RecallCodeOutcome {
 	if (result.status === "reverted") {
-		return { status: "reverted", reverted: result.reverted, deleted: result.deleted, skipped: result.skipped };
+		return {
+			status: "reverted",
+			reverted: result.reverted,
+			deleted: result.deleted,
+			skipped: result.skipped,
+		};
 	}
 	if (result.status === "conflict") {
 		return {
@@ -758,10 +763,24 @@ export class PiBackend {
 		const sessionId = session.sessionId;
 		const turnIndexOf = (): number => countUserTurns(session.sessionManager.getBranch()) - 1;
 		void this.snapshots.ensureBaseline(sessionId, cwd, turnIndexOf(), this.isExclusiveCwd(cwd, sessionId));
-		const unsubscribe = session.subscribe((event) => {
-			if (event.type !== "agent_settled" || event.aborted) return;
-			if (session.isStreaming || session.isCompacting) return;
+		// 打点触发点：**turn_end 为主**（一次 run 里 followUp 排队会有多轮，只靠 agent_settled
+		// 会跳过中间那些轮，见 review BUG C），agent_settled 兜底。
+		// 同一 turnIndex 的多次打点由 SessionSnapshots.record 覆盖（同轮多次 turn_end 是常态）。
+		const snap = (): void => {
+			if (session.isCompacting) return;
 			void this.snapshots.record(sessionId, cwd, turnIndexOf(), this.isExclusiveCwd(cwd, sessionId));
+		};
+		const unsubscribe = session.subscribe((event) => {
+			if (event.type === "turn_end") {
+				// ❗ 不要判 `event.aborted`：那是 agent_settled 的字段，turn_end 里没有。
+				// abort 前已完成的轮次是真实改动，仍要打点。
+				snap();
+				return;
+			}
+			if (event.type !== "agent_settled") return;
+			// settled 只兜底（turn_end 已经拍过同一 turnIndex 会被覆盖，代价只是一次 add -A）
+			if (session.isStreaming) return;
+			snap();
 		});
 		const entry = this.registry.get(sessionId);
 		if (entry) this.snapshotUnsubs.set(entry, unsubscribe);
@@ -770,9 +789,7 @@ export class PiBackend {
 
 	/** 打点时刻同 cwd 没有其他活跃可写会话（快照窗口内可整片回退） */
 	private isExclusiveCwd(cwd: string, selfId: string): boolean {
-		return !this.registry
-			.list()
-			.some((e) => !e.readOnly && e.cwd === cwd && e.session.sessionId !== selfId);
+		return !this.registry.list().some((e) => !e.readOnly && e.cwd === cwd && e.session.sessionId !== selfId);
 	}
 
 	async listSessions(cwd?: string): Promise<SessionMeta[]> {
@@ -1476,16 +1493,17 @@ export class PiBackend {
 		// 持久化回退点：custom entry 不参与 LLM 上下文，只把 leaf 移动写进文件
 		// （否则撤回只存在内存，重启后旧分支回来）
 		sm.appendCustomEntry(PiBackend.RECALLED_MARKER_TYPE, { recalledEntryId: targetId });
-		// 时间线重置：目标轮及之后的快照作废，以撤回后的现场作为新的「第 targetTurn-1 轮」
-		if (code?.status === "reverted") {
-			await this.snapshots.commitRecall(
-				sessionId,
-				entry.cwd,
-				targetTurn,
-				code.postTreeOid,
-				this.isExclusiveCwd(entry.cwd, sessionId),
-			);
-		}
+		// 时间线重置：目标轮及之后的快照作废，以撤回后的现场作为新的「第 targetTurn-1 轮」。
+		// ❗ **无论 code 状态都要重置**：对话已经撤回了，时间线不重置会让数组不再单调，
+		// 下一条 record 追加更小的 turnIndex，之后 beforeTurn 从尾向前找到它 → 静默空转（review BUG D）。
+		// `reverted` 直接用合并树不重拍；`unavailable`/`undefined` 时 commitRecall 内部现拍一次。
+		await this.snapshots.commitRecall(
+			sessionId,
+			entry.cwd,
+			targetTurn,
+			code?.status === "reverted" ? code.postTreeOid : undefined,
+			this.isExclusiveCwd(entry.cwd, sessionId),
+		);
 		log.info("recall message", sessionId, { targetId, targetTurn, code: code?.status });
 		return {
 			recalled: true,
@@ -1520,7 +1538,6 @@ export class PiBackend {
 				cwd,
 				targetTurn,
 				ledgerPaths,
-				isExclusiveNow: this.isExclusiveCwd(cwd, sessionId),
 			});
 			return result;
 		} catch (error) {

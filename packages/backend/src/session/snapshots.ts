@@ -57,8 +57,6 @@ export interface RecallCodeRequest {
 	targetTurn: number;
 	/** 窗口内 deriveTurnChanges 的 path 并集（原始，未归一） */
 	ledgerPaths: string[];
-	/** 当前是否独占（仅在记录 recall 快照时用；回退范围按历史记录判定） */
-	isExclusiveNow: boolean;
 }
 
 export interface RecallCodeSuccess {
@@ -168,7 +166,14 @@ export class SessionSnapshots {
 		}
 	}
 
-	/** agent 跑完一轮后调用；内部按 sessionId 串行排队 */
+	/**
+	 * 打点：`turnIndex` 已有条目则**覆盖**（同轮可能多次 turn_end），否则追加。
+	 *
+	 * ❗ 不能用「只 append」：followUp 排队时一轮里有多条 user 消息，`agent_settled` 是
+	 * 整个 run 结束才发，按 settled 打点会跳过中间那一轮（review BUG C）。改成按 turn_end
+	 * 打点后，同一 turnIndex 会被打多次（每次 turn_end 都是一次完整的工作区状态）。
+	 * 覆盖时把旧条目的 ref 一并删掉（它指向的 commit 已被新条目接管）。
+	 */
 	async record(sessionId: string, cwd: string, turnIndex: number, exclusive: boolean): Promise<void> {
 		if (!this.gitAvailable) return;
 		const rt = this.sessions.get(sessionId);
@@ -184,6 +189,13 @@ export class SessionSnapshots {
 		try {
 			await this.enqueue(rt, async () => {
 				const { treeOid, skipped } = await snapshotTree(rt.repo, { skipOverBytes: this.skipOverBytes });
+				// 同 turnIndex 覆盖（同轮多次 turn_end）：**必须先摘掉旧条目和它的 ref**，
+				// 再建新 ref —— 否则新 ref 与旧 ref 同名，刚建好就被下面这行删掉。
+				const existing = rt.state.snapshots.findIndex((s) => s.turnIndex === turnIndex);
+				if (existing >= 0) {
+					const [old] = rt.state.snapshots.splice(existing, 1);
+					if (old?.ref) await deleteSnapshots(rt.repo, [old.ref]);
+				}
 				const last = rt.state.snapshots[rt.state.snapshots.length - 1];
 				// 内容没变 → 不新建 commit 对象，但**仍然给本条目自己的 ref**（复用同一个 commit OID）。
 				// 理由：ref 是条目的 liveness。若让本条 ref 空着、只靠前一条的 ref 撑着这棵树，
@@ -383,13 +395,17 @@ export class SessionSnapshots {
 
 	/**
 	 * 撤回成功后重置时间线：删掉 `turnIndex >= targetTurn` 的条目，再 push 一条 recall。
-	 * `postTreeOid` 用 `recallCode` 返回的合并树，不必重拍。
+	 *
+	 * `postTreeOid` 用 `recallCode` 返回的合并树（`reverted` 时）不必重拍；
+	 * **code 侧 `unavailable` 时也要传 `undefined` 进来调一次** —— 对话已经撤了，
+	 * 时间线不重置就会让数组不再单调，之后撤回静默空转（review BUG D）。
+	 * 传 `undefined` 时这里现拍一次（30–130ms，撤回是低频操作）。
 	 */
 	async commitRecall(
 		sessionId: string,
 		cwd: string,
 		targetTurn: number,
-		postTreeOid: string,
+		postTreeOid: string | undefined,
 		exclusive: boolean,
 	): Promise<void> {
 		if (!this.gitAvailable) return;
@@ -401,13 +417,15 @@ export class SessionSnapshots {
 		}
 		try {
 			await this.enqueue(rt, async () => {
+				const treeOid =
+					postTreeOid ?? (await snapshotTree(rt.repo, { skipOverBytes: this.skipOverBytes })).treeOid;
 				const dropped = rt.state.snapshots.filter((s) => s.turnIndex >= targetTurn);
 				rt.state.snapshots = rt.state.snapshots.filter((s) => s.turnIndex < targetTurn);
 				await deleteSnapshots(rt.repo, refsOf(dropped));
-				const commit = await this.commitOrNull(rt, postTreeOid, "recall", targetTurn - 1);
+				const commit = await this.commitOrNull(rt, treeOid, "recall", targetTurn - 1);
 				rt.state.snapshots.push({
 					turnIndex: targetTurn - 1,
-					treeOid: postTreeOid,
+					treeOid,
 					commitOid: commit?.commitOid,
 					ref: commit?.ref,
 					exclusive,

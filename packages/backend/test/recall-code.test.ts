@@ -109,10 +109,10 @@ async function fixture() {
 		} as unknown as ModelRuntime,
 	});
 	sessions.push(session);
-	/** 每次模型请求前跑一次：模拟 agent 在这一轮里改文件 */
-	let onRequest: (() => void) | undefined;
+	/** 每次模型请求前跑一次：模拟 agent 在这一轮里改文件；可以返回一个 Promise 卡住这一轮 */
+	let onRequest: (() => void | Promise<void>) | undefined;
 	session.agent.streamFunction = async () => {
-		onRequest?.();
+		await onRequest?.();
 		const stream = createAssistantMessageEventStream();
 		stream.push({ type: "done", reason: "stop", message: doneMessage() });
 		return stream;
@@ -157,7 +157,7 @@ async function fixture() {
 		cwd,
 		root,
 		run: (b: PiBackend, text: string) => run(b, text),
-		setOnRequest: (fn: () => void) => {
+		setOnRequest: (fn: () => void | Promise<void>) => {
 			onRequest = fn;
 		},
 	};
@@ -207,6 +207,110 @@ describe("PiBackend 撤回代码（阶段 3 接线）", () => {
 		expect(
 			f.session.sessionManager.getBranch().filter((e) => e.type === "message" && e.message.role === "user"),
 		).toHaveLength(0);
+		await f.backend.dispose();
+	});
+
+	it("followUp 排队的第二轮也有自己的快照：撤回第二轮回到第一轮之后的状态（BUG C）", async () => {
+		const f = await fixture();
+		writeFileSync(join(f.cwd, "a.txt"), "base\n");
+		await waitEntries(f.backend, f.session.sessionId, 1);
+
+		// 第 1 轮：卡住流，让第 2 条 user 消息在 run 期间排队成 followUp
+		let release = (): void => {};
+		const gate = new Promise<void>((r) => {
+			release = r;
+		});
+		let request = 0;
+		f.setOnRequest(async () => {
+			request += 1;
+			if (request === 1) {
+				writeFileSync(join(f.cwd, "a.txt"), "after-first\n");
+				await gate;
+			} else {
+				// 真实场景第二轮要先发一次模型请求（几百毫秒），足够上一轮的打点落地；
+				// 这里没有网络延迟，必须自己让出时间，否则 turn 0 的快照会拍到第二轮的内容
+				// （打点是异步队列，见 IMPL-NOTES「打点与下一轮的竞态」）。
+				await new Promise((r) => setTimeout(r, 300));
+				writeFileSync(join(f.cwd, "a.txt"), "after-second\n");
+			}
+		});
+
+		const settled = new Promise<void>((resolve) => {
+			const off = f.session.subscribe((e) => {
+				if (e.type === "agent_settled") {
+					off();
+					resolve();
+				}
+			});
+		});
+		await f.backend.prompt(f.session.sessionId, "第一条");
+		// 等第 1 轮真的开跑，再把第二条挤进 followUp 队列
+		for (let i = 0; i < 100 && !f.session.isStreaming; i += 1) await new Promise((r) => setTimeout(r, 10));
+		await f.backend.prompt(f.session.sessionId, "第二条");
+		release();
+		await settled;
+		await waitEntries(f.backend, f.session.sessionId, 3); // baseline + turn 0 + turn 1
+
+		expect(readFileSync(join(f.cwd, "a.txt"), "utf8")).toBe("after-second\n");
+		const entries = attach(f.backend).snapshots.entriesOf(f.session.sessionId) as {
+			turnIndex: number;
+			kind: string;
+		}[];
+		// 关键：turn 0 与 turn 1 都要有（旧实现只有 settled 打点 → 只剩 turn 1）
+		expect(entries.map((e) => e.turnIndex)).toEqual([-1, 0, 1]);
+
+		const branch = f.session.sessionManager.getBranch();
+		const userMessages = branch.filter((e) => e.type === "message" && e.message.role === "user");
+		expect(userMessages).toHaveLength(2);
+		const second = userMessages[1];
+		if (second?.type !== "message") throw new Error("missing second user message");
+
+		const recalled = await f.backend.recallMessage(f.session.sessionId, { entryId: second.id });
+		expect(recalled.recalled).toBe(true);
+		expect(recalled.code?.status).toBe("reverted");
+		// 回到「第 1 轮之后」的状态，而不是 out-of-window / 一字节没动
+		expect(readFileSync(join(f.cwd, "a.txt"), "utf8")).toBe("after-first\n");
+		await f.backend.dispose();
+	});
+
+	it("code 侧 unavailable 时仍然重置时间线（BUG D：传 undefined 让 commitRecall 现拍）", async () => {
+		const f = await fixture();
+		writeFileSync(join(f.cwd, "a.txt"), "base\n");
+		await waitEntries(f.backend, f.session.sessionId, 1);
+		f.setOnRequest(() => writeFileSync(join(f.cwd, "a.txt"), "v2\n"));
+		await f.run(f.backend, "改一下");
+		await waitEntries(f.backend, f.session.sessionId, 2);
+
+		// 强制 code 那一半失败（模拟 git 不可用 / internal），只撤对话
+		const snaps = attach(f.backend).snapshots as unknown as {
+			recallCode: (req: unknown) => Promise<unknown>;
+			commitRecall: (a: string, b: string, c: number, d: string | undefined, e: boolean) => Promise<void>;
+		};
+		const calls: (string | undefined)[] = [];
+		const realRecall = snaps.recallCode.bind(snaps);
+		const realCommit = snaps.commitRecall.bind(snaps);
+		snaps.recallCode = async () => ({ status: "unavailable", reason: "test" });
+		snaps.commitRecall = async (a, b, c, d, e) => {
+			calls.push(d);
+			return realCommit(a, b, c, d, e);
+		};
+
+		const branch = f.session.sessionManager.getBranch();
+		const user = branch.findLast((e) => e.type === "message" && e.message.role === "user");
+		if (user?.type !== "message") throw new Error("missing user message");
+		const recalled = await f.backend.recallMessage(f.session.sessionId, { entryId: user.id });
+
+		snaps.recallCode = realRecall;
+		snaps.commitRecall = realCommit;
+		expect(recalled.recalled).toBe(true);
+		expect(recalled.code?.status).toBe("unavailable");
+		// 关键：时间线照样重置，且 postTreeOid 传 undefined（由 commitRecall 现拍）
+		expect(calls).toEqual([undefined]);
+		// 时间线只剩基线 + recall 条目（第 1 轮被丢弃）
+		const kinds = (attach(f.backend).snapshots.entriesOf(f.session.sessionId) as { kind: string }[]).map(
+			(e) => e.kind,
+		);
+		expect(kinds).toEqual(["baseline", "recall"]);
 		await f.backend.dispose();
 	});
 

@@ -88,6 +88,51 @@ describe("snapshots：打点与时间线", () => {
 		]);
 	});
 
+	it("同一 turnIndex 打点两次：覆盖而不是追加（同轮多次 turn_end，BUG C）", async () => {
+		if (!gitOk) return;
+		write("a.txt", "base\n");
+		await snapshots.ensureBaseline(SID, cwd, -1, true);
+		await snapshots.idle(SID);
+		// 同一轮里 turn_end 会来多次：先半成品、再成品
+		await round(0, { "a.txt": "half\n" });
+		await round(0, { "a.txt": "done\n" });
+
+		const entries = snapshots.entriesOf(SID);
+		expect(entries.map((e) => e.turnIndex)).toEqual([-1, 0]);
+		// 覆盖后保留的是**最后一次**的内容
+		await round(1, { "a.txt": "next\n" });
+		const res = await snapshots.recallCode({
+			sessionId: SID,
+			cwd,
+			targetTurn: 1,
+			ledgerPaths: ["a.txt"],
+		});
+		expect(res.status).toBe("reverted");
+		expect(read("a.txt")).toBe("done\n");
+	});
+
+	it("覆盖同一 turnIndex 时旧条目的 ref 被删掉（否则 commit 泄漏）", async () => {
+		if (!gitOk) return;
+		write("a.txt", "base\n");
+		await snapshots.ensureBaseline(SID, cwd, -1, true);
+		await snapshots.idle(SID);
+		await round(0, { "a.txt": "half\n" });
+		const before = snapshots.entriesOf(SID);
+		expect(before.map((e) => e.ref)).toEqual(["refs/snap/baseline--1", "refs/snap/turn-0"]);
+		await round(0, { "a.txt": "done\n" });
+		const refs = await rawGit(null, [
+			"--git-dir",
+			join(snapDir, `${SID}.git`),
+			"for-each-ref",
+			"--format=%(refname)",
+		]);
+		// 仍然只有两条 ref：覆盖没有留下孤儿
+		expect(refs.stdout.split("\n").filter(Boolean).sort()).toEqual([
+			"refs/snap/baseline--1",
+			"refs/snap/turn-0",
+		]);
+	});
+
 	it("元数据落盘后可被新实例读回", async () => {
 		if (!gitOk) return;
 		write("a.txt", "x\n");
@@ -125,7 +170,6 @@ describe("snapshots：撤回", () => {
 			cwd,
 			targetTurn: 1,
 			ledgerPaths: ["a.txt"],
-			isExclusiveNow: true,
 		});
 		expect(res.status).toBe("reverted");
 		if (res.status !== "reverted") return;
@@ -144,7 +188,6 @@ describe("snapshots：撤回", () => {
 			cwd,
 			targetTurn: 1,
 			ledgerPaths: ["a.txt"],
-			isExclusiveNow: true,
 		});
 		expect(res.status).toBe("reverted");
 		expect(read("a.txt")).toBe("r0\n");
@@ -158,7 +201,6 @@ describe("snapshots：撤回", () => {
 			cwd,
 			targetTurn: 0,
 			ledgerPaths: ["a.txt"],
-			isExclusiveNow: true,
 		});
 		expect(res.status).toBe("reverted");
 		expect(read("a.txt")).toBe("base\n");
@@ -174,7 +216,6 @@ describe("snapshots：撤回", () => {
 			cwd,
 			targetTurn: 0,
 			ledgerPaths: ["agent.txt"],
-			isExclusiveNow: true,
 		});
 		expect(res.status).toBe("reverted");
 		if (res.status !== "reverted") return;
@@ -193,7 +234,6 @@ describe("snapshots：撤回", () => {
 			cwd,
 			targetTurn: 0,
 			ledgerPaths: ["a.txt"],
-			isExclusiveNow: true,
 		});
 		expect(res.status).toBe("reverted");
 		expect(read("untouched.txt")).toBe("user made this\n");
@@ -222,7 +262,6 @@ describe("snapshots：撤回", () => {
 			cwd,
 			targetTurn: 0,
 			ledgerPaths: ["a.txt"],
-			isExclusiveNow: true,
 		});
 		expect(res.status).toBe("reverted");
 		// 第 1 行回到 base（agent 改过），第 8 行保留用户改动
@@ -242,7 +281,6 @@ describe("snapshots：撤回", () => {
 			cwd,
 			targetTurn: 0,
 			ledgerPaths: ["a.txt"],
-			isExclusiveNow: true,
 		});
 		expect(res.status).toBe("conflict");
 		if (res.status !== "conflict") return;
@@ -272,7 +310,6 @@ describe("snapshots：撤回", () => {
 			cwd,
 			targetTurn: 0,
 			ledgerPaths: ["img.png"],
-			isExclusiveNow: true,
 		});
 		expect(res.status).toBe("conflict");
 		if (res.status !== "conflict") return;
@@ -307,7 +344,6 @@ describe("snapshots：撤回", () => {
 			cwd,
 			targetTurn: 0,
 			ledgerPaths: ["img.png"],
-			isExclusiveNow: true,
 		});
 		expect(res.status).toBe("reverted");
 		if (res.status !== "reverted") return;
@@ -329,7 +365,6 @@ describe("snapshots：撤回", () => {
 			cwd,
 			targetTurn: 0,
 			ledgerPaths: ["a.txt"],
-			isExclusiveNow: true,
 		});
 		expect(res.status).toBe("conflict");
 
@@ -364,7 +399,6 @@ describe("snapshots：撤回", () => {
 			cwd,
 			targetTurn: 1,
 			ledgerPaths: ["b.txt"],
-			isExclusiveNow: true,
 		});
 		expect(again.status).toBe("reverted");
 		expect(existsSync(join(cwd, "b.txt"))).toBe(false);
@@ -383,7 +417,6 @@ describe("snapshots：撤回", () => {
 			cwd,
 			targetTurn: 0,
 			ledgerPaths: ["a.txt"], // 只有 a.txt 在账本里
-			isExclusiveNow: true,
 		});
 		expect(res.status).toBe("reverted");
 		expect(read("a.txt")).toBe("base\n");
@@ -401,7 +434,6 @@ describe("snapshots：撤回", () => {
 			cwd,
 			targetTurn: 0,
 			ledgerPaths: ["a.txt"],
-			isExclusiveNow: true,
 		});
 		expect(res.status).toBe("reverted");
 		if (res.status !== "reverted") return;
@@ -420,7 +452,6 @@ describe("snapshots：撤回", () => {
 			cwd,
 			targetTurn: 1,
 			ledgerPaths: ["a.txt"],
-			isExclusiveNow: true,
 		});
 		if (res.status !== "reverted") throw new Error(`expected reverted, got ${res.status}`);
 
@@ -436,6 +467,47 @@ describe("snapshots：撤回", () => {
 		expect(snapshots.entriesOf(SID).map((e) => e.turnIndex)).toEqual([-1, 0, 0, 1]);
 	});
 
+	it("code 侧 unavailable（postTreeOid 未定义）也要重置时间线：条目保持单调（BUG D）", async () => {
+		if (!gitOk) return;
+		await round(0, { "a.txt": "r0\n" });
+		await round(1, { "a.txt": "r1\n" });
+		await round(2, { "a.txt": "r2\n" });
+		// 模拟 code 侧没跑成（git 不可用 / internal）：只撤了对话，工作区留在 r2
+		await snapshots.commitRecall(SID, cwd, 2, undefined, true);
+		await snapshots.idle(SID);
+
+		// recall 条目落在 targetTurn-1（「第 2 轮之前」的状态），与已有的 turn-1 条目同槽位 —— 这是设计如此
+		const entries = snapshots.entriesOf(SID);
+		expect(entries.map((e) => e.turnIndex)).toEqual([-1, 0, 1, 1]);
+		expect(entries.map((e) => e.kind)).toEqual(["baseline", "turn", "turn", "recall"]);
+		// 单调性（BUG D 的核心）：下一条打点追加的 turnIndex 必须比尾部大，不能回退
+		await round(2, { "a.txt": "r2b\n" });
+		const after = snapshots.entriesOf(SID).map((e) => e.turnIndex);
+		expect(after).toEqual([-1, 0, 1, 1, 2]);
+		expect([...after].sort((a, b) => a - b)).toEqual(after);
+	});
+
+	it("unavailable 重置后的撤回不空转：真的倒回到目标轮之前（BUG D 回归）", async () => {
+		if (!gitOk) return;
+		await round(0, { "a.txt": "r0\n" });
+		await round(1, { "a.txt": "r1\n" });
+		await snapshots.commitRecall(SID, cwd, 1, undefined, true);
+		await snapshots.idle(SID);
+		// 撤回后又跑了一轮，用户继续改
+		await round(1, { "a.txt": "r1-after\n" });
+		await round(2, { "a.txt": "r2\n" });
+
+		const res = await snapshots.recallCode({
+			sessionId: SID,
+			cwd,
+			targetTurn: 2,
+			ledgerPaths: ["a.txt"],
+		});
+		expect(res.status).toBe("reverted");
+		// 倒回到第 1 轮打点时的状态（r1-after），而不是一个字节没动还报成功
+		expect(read("a.txt")).toBe("r1-after\n");
+	});
+
 	it("撤回后再撤回同一轮：拿到的是 recall 那条（回到撤回后的状态）", async () => {
 		if (!gitOk) return;
 		await round(0, { "a.txt": "r0\n" });
@@ -445,7 +517,6 @@ describe("snapshots：撤回", () => {
 			cwd,
 			targetTurn: 1,
 			ledgerPaths: ["a.txt"],
-			isExclusiveNow: true,
 		});
 		if (first.status !== "reverted") throw new Error("first recall failed");
 		await snapshots.commitRecall(SID, cwd, 1, first.postTreeOid, true);
@@ -459,7 +530,6 @@ describe("snapshots：撤回", () => {
 			cwd,
 			targetTurn: 1,
 			ledgerPaths: ["a.txt"],
-			isExclusiveNow: true,
 		});
 		expect(second.status).toBe("reverted");
 		expect(read("a.txt")).toBe("r0\n");
@@ -479,7 +549,6 @@ describe("snapshots：撤回", () => {
 			cwd,
 			targetTurn: 4,
 			ledgerPaths: ["a.txt"],
-			isExclusiveNow: true,
 		});
 		expect(res.status).toBe("reverted");
 		expect(read("a.txt")).toBe("base\n");
@@ -534,7 +603,6 @@ describe("snapshots：撤回", () => {
 			cwd,
 			targetTurn: 0,
 			ledgerPaths: ["a.txt"],
-			isExclusiveNow: true,
 		});
 		expect(res.status).toBe("conflict");
 		if (res.status === "conflict") expect(res.reason).toBe("out-of-window");
@@ -547,7 +615,6 @@ describe("snapshots：撤回", () => {
 			cwd,
 			targetTurn: 5,
 			ledgerPaths: ["a.txt"],
-			isExclusiveNow: true,
 		});
 		expect(res2.status).toBe("conflict");
 		if (res2.status === "conflict") expect(res2.reason).toBe("out-of-window");
@@ -558,7 +625,6 @@ describe("snapshots：撤回", () => {
 			cwd,
 			targetTurn: 1,
 			ledgerPaths: ["a.txt"],
-			isExclusiveNow: true,
 		});
 		expect(ok.status).toBe("reverted");
 		expect(read("a.txt")).toBe("r0\n");
@@ -592,7 +658,6 @@ describe("snapshots：撤回", () => {
 			cwd,
 			targetTurn: 2,
 			ledgerPaths: ["a.txt", "c.txt"],
-			isExclusiveNow: true,
 		});
 		expect(res.status).toBe("conflict");
 		if (res.status === "conflict") expect(res.reason).toBe("out-of-window");
@@ -634,7 +699,6 @@ describe("snapshots：撤回", () => {
 			cwd,
 			targetTurn: 1,
 			ledgerPaths: ["a.txt"],
-			isExclusiveNow: true,
 		});
 		expect(res.status).toBe("reverted");
 		expect(read("a.txt")).toBe("base\n");
@@ -650,7 +714,6 @@ describe("snapshots：降级与清理", () => {
 			cwd,
 			targetTurn: 0,
 			ledgerPaths: [],
-			isExclusiveNow: true,
 		});
 		expect(res.status).toBe("unavailable");
 	});
