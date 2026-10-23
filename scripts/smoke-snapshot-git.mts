@@ -20,9 +20,14 @@
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import {
+	IDENTITY,
+	INFO_ATTRIBUTES,
+	INFO_EXCLUDE,
+	md5 as fixtureMd5,
+} from "../packages/backend/test/helpers/snapshot-fixture.ts";
 
 const exec = promisify(execFile);
 
@@ -34,13 +39,6 @@ function check(name: string, ok: boolean, detail = ""): void {
 
 const playground = mkdtempSync(join(tmpdir(), "percho-smoke-snap-git-"));
 console.log(`[setup] playground: ${playground}`);
-
-const IDENTITY = {
-	GIT_AUTHOR_NAME: "percho",
-	GIT_AUTHOR_EMAIL: "snapshot@local",
-	GIT_COMMITTER_NAME: "percho",
-	GIT_COMMITTER_EMAIL: "snapshot@local",
-};
 
 interface Shadow {
 	gitDir: string;
@@ -142,29 +140,8 @@ async function gitStdin(
 	});
 }
 
-const md5 = (buf: Buffer | string): string => createHash("md5").update(buf).digest("hex");
+const md5 = fixtureMd5;
 const fileMd5 = (p: string): string => md5(readFileSync(p));
-
-/** info/attributes：压制一切 text/filter/encoding 转换（阶段 0 实测结论）。 */
-const INFO_ATTRIBUTES = "* -text -filter -working-tree-encoding\n";
-
-/** info/exclude：与工作区 .gitignore 叠加（不是替代）。 */
-const INFO_EXCLUDE = [
-	"node_modules/",
-	"dist/",
-	"dist-electron/",
-	"out/",
-	"build/",
-	".next/",
-	".turbo/",
-	".cache/",
-	".local/",
-	"coverage/",
-	"*.log",
-	".DS_Store",
-	"Thumbs.db",
-	"",
-].join("\n");
 
 async function initShadow(sh: Shadow): Promise<void> {
 	mkdirSync(join(sh.gitDir, ".."), { recursive: true });
@@ -196,12 +173,30 @@ async function listCandidatePaths(sh: Shadow): Promise<string[]> {
 	return [...new Set([...split(tracked.stdout), ...split(untracked.stdout)])].sort();
 }
 
-/** 快照：add -A → 剔除超限路径 → write-tree。 */
+/** 枚举嵌套 git 仓库（含未 commit 的）。必须在 add -A 之前排除，见断言 17。 */
+async function findNestedRepos(sh: Shadow): Promise<string[]> {
+	const listed = await git(sh, ["ls-files", "-o", "--exclude-standard", "--directory", "-z"]);
+	const found: string[] = [];
+	for (const entry of listed.stdout.split("")) {
+		if (!entry.endsWith("/")) continue;
+		const dir = entry.slice(0, -1);
+		if (existsSync(join(sh.workTree, dir, ".git"))) found.push(dir);
+	}
+	return found;
+}
+
+/** 快照：排除嵌套仓库 → add -A → 剔除超限路径/gitlink → write-tree。 */
 async function snapshotTree(sh: Shadow, skipOverBytes: number): Promise<{ treeOid: string; skipped: string[] }> {
-	await git(sh, ["add", "-A"]);
+	const nested = await findNestedRepos(sh);
+	const addArgs = ["add", "-A"];
+	if (nested.length > 0) {
+		addArgs.push("--");
+		for (const dir of nested) addArgs.push(`:(exclude)${dir}`);
+	}
+	await git(sh, addArgs);
 	// 用 index 里的路径 + 磁盘 size 判定（首次快照没有 HEAD，不能用 ls-tree HEAD）
 	const candidates = await listCandidatePaths(sh);
-	const skipped: string[] = [];
+	const skipped: string[] = [...nested];
 	for (const rel of candidates) {
 		const abs = join(sh.workTree, rel);
 		try {
@@ -800,6 +795,50 @@ async function main(): Promise<void> {
 			late.late === true,
 			`code=${late.lateMergeCode}`,
 		);
+	}
+
+	// ============ 17. 嵌套仓库未 commit 时 add -A 直接 128 失败 ============
+	// 阶段 1 实测发现：这不是「加进去再剔」能解决的 —— add 自己就挂了。
+	console.log("\n=== 17. 嵌套仓库无 commit → add -A 128 失败，必须提前排除 ===");
+	{
+		const root = join(playground, "p17");
+		const wt = join(root, "wt");
+		const vendor = join(wt, "vendor");
+		mkdirSync(vendor, { recursive: true });
+		writeFileSync(join(wt, "a.txt"), "a\n");
+		writeFileSync(join(vendor, "v.txt"), "v\n");
+		await exec("git", ["init", "-q"], { cwd: vendor });
+		const sh = shadowOf(root);
+		await initShadow(sh);
+
+		// 反证：裸 add -A 失败
+		const raw = await git(sh, ["add", "-A"]);
+		check("17 反证：裸 add -A 在未 commit 的嵌套仓库上失败", raw.code === 128, `code=${raw.code}`);
+		check(
+			"17 错误文案是 does not have a commit checked out",
+			raw.stderr.includes("does not have a commit checked out"),
+			(raw.stderr.trim().split("\n")[0] ?? "").slice(0, 120),
+		);
+
+		// 正解：pathspec 排除
+		const excluded = await git(sh, ["add", "-A", "--", ":(exclude)vendor"]);
+		check("17 pathspec exclude 后 add -A 成功", excluded.code === 0, `code=${excluded.code}`);
+
+		// 端到端：snapshotTree 在同样场景下不抛
+		let threw = "";
+		let treeOid = "";
+		try {
+			const r = await snapshotTree(sh, 1024 * 1024);
+			treeOid = r.treeOid;
+		} catch (err) {
+			threw = String(err).slice(0, 200);
+		}
+		check("17 snapshotTree 不抛（已提前排除嵌套仓库）", threw === "", threw);
+		if (treeOid) {
+			const lsTree = await git(sh, ["ls-tree", "-r", "--name-only", treeOid]);
+			const paths = lsTree.stdout.split("\n").filter(Boolean);
+			check("17 快照只含 a.txt，不含 vendor", paths.length === 1 && paths[0] === "a.txt", JSON.stringify(paths));
+		}
 	}
 
 	// ================= 汇总 =================
