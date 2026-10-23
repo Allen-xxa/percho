@@ -10,9 +10,13 @@
 // ❗ 阶段 0 实测发现的关键事实（HANDOFF 未覆盖，已回写 channel）：
 //   1. 工作区 `.gitattributes` 的 `* text=auto` 会让 `git add` 把 CRLF 归一化成 LF 存进 blob，
 //      写回时 checkout filter 又反向转换 → 纯行尾混杂文件被静默改写（第 5 条原设计失败）。
-//   2. 补救：影子库 `<GIT_DIR>/info/attributes` 写 `* -text -filter -working-tree-encoding diff`，
+//   2. 补救：影子库 `<GIT_DIR>/info/attributes` 写 `* -text -filter -working-tree-encoding`，
 //      该文件优先级最高（压过任意深度的 `.gitattributes`），入站与写回两个方向都不过滤，
 //      且 `merge-tree` 的行级合并仍然正常（`-text` 只关 eol 归一化，不把文件当二进制）。
+//   3. **绝对不要加 `diff` 属性**（review 实测）：加了之后 `git diff --binary` 对二进制退化成
+//      含裸 NUL 的伪文本 diff（PNG：332B/0 NUL → 1785B/40 NUL），无法安全贴进输入框；
+//      且 `git diff --numstat` 会把二进制报成 `1\t1` 而不是 `-\t-`，污染二进制判定。
+//      字节保真完全不需要 `diff`。
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -142,7 +146,7 @@ const md5 = (buf: Buffer | string): string => createHash("md5").update(buf).dige
 const fileMd5 = (p: string): string => md5(readFileSync(p));
 
 /** info/attributes：压制一切 text/filter/encoding 转换（阶段 0 实测结论）。 */
-const INFO_ATTRIBUTES = "* -text -filter -working-tree-encoding diff\n";
+const INFO_ATTRIBUTES = "* -text -filter -working-tree-encoding\n";
 
 /** info/exclude：与工作区 .gitignore 叠加（不是替代）。 */
 const INFO_EXCLUDE = [
@@ -713,6 +717,89 @@ async function main(): Promise<void> {
 			check("14 二次快照 < 5s", secondMs < 5_000, `${secondMs}ms`);
 			check("14 二次与首次 tree 相同", first.treeOid === second.treeOid, `${first.treeOid.slice(0, 8)} vs ${second.treeOid.slice(0, 8)}`);
 		}
+	}
+
+	// ============ 15. 二进制不被 diff 属性污染（review 阶段新增） ============
+	// `info/attributes` 里绝不能有 `diff`：加了之后 `git diff --binary` 对二进制退化成含裸 NUL
+	// 的伪文本 diff（无法安全贴进输入框），且 `--numstat` 会把二进制报成 `1\t1` 而不是 `-\t-`。
+	console.log("\n=== 15. 二进制：numstat 报 -/- 、修复包无 NUL ===");
+	{
+		const root = join(playground, "p15");
+		const wt = join(root, "wt");
+		mkdirSync(wt, { recursive: true });
+		const sh = shadowOf(root);
+		await initShadow(sh);
+		// PNG 魔数 + 随机字节，确保 git 一眼认成二进制
+		const png = Buffer.concat([
+			Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+			Buffer.from(Array.from({ length: 400 }, (_, i) => (i * 37 + 11) % 256)),
+		]);
+		writeFileSync(join(wt, "img.png"), png);
+		await git(sh, ["add", "-A"]);
+		const t0 = (await git(sh, ["write-tree"])).stdout.trim();
+		// 改一个字节再快照
+		const png2 = Buffer.from(png);
+		png2[100] = (png2[100]! + 1) % 256;
+		writeFileSync(join(wt, "img.png"), png2);
+		await git(sh, ["add", "-A"]);
+		const t1 = (await git(sh, ["write-tree"])).stdout.trim();
+
+		const numstat = (await git(sh, ["diff", "--numstat", t0, t1])).stdout.trim();
+		check("15 numstat 把 PNG 报成 -/-", numstat.startsWith("-\t-\t"), JSON.stringify(numstat));
+
+		const patch = (await git(sh, ["diff", "--binary", t0, t1])).stdout;
+		const nulCount = Buffer.from(patch, "utf8").filter((b) => b === 0).length;
+		check("15 修复包含 GIT binary patch", patch.includes("GIT binary patch"), `len=${patch.length}`);
+		check("15 修复包 0 个 NUL（可安全过 JSON/IPC/模型）", nulCount === 0, `NUL=${nulCount}`);
+		check("15 修复包纯 ASCII", /^[\x09\x0a\x20-\x7e]*$/.test(patch), `len=${patch.length}`);
+
+		// 字节保真不靠 diff：写回后 md5 必须等于快照时刻磁盘上的 md5
+		// （不能用 `cat-file -p` 拿 stdout 算 md5 —— git() 走 utf8 解码，二进制会被破坏）
+		const wantMd5 = md5(png);
+		await git(sh, ["read-tree", "-u", "--reset", t0]);
+		const backMd5 = md5(readFileSync(join(wt, "img.png")));
+		check("15 去掉 diff 后二进制字节仍保真", wantMd5 === backMd5, `want=${wantMd5.slice(0, 8)} disk=${backMd5.slice(0, 8)}`);
+	}
+
+	// ============ 16. git 二进制启发式只看前 8000 字节（阶段 1 detectBinaryPaths 的依据） ============
+	// NUL 在 8000 字节之后 → git 当文本 → merge-tree 静默行级合并 → 产出半坏文件，
+	// 违反 spec 3.1「二进制没法按行合并 → 类别 A 冲突」。所以不能依赖 git 的启发式。
+	console.log("\n=== 16. 二进制启发式只看前 8000 字节 ===");
+	{
+		const build = async (nulOffset: number, name: string): Promise<{ late: boolean; lateMergeCode: number }> => {
+			const root = join(playground, name);
+			const wt = join(root, "wt");
+			mkdirSync(wt, { recursive: true });
+			const sh = shadowOf(root);
+			await initShadow(sh);
+			const mk = (line3: string, line1995: string): Buffer => {
+				const lines = Array.from({ length: 2000 }, (_, i) => `line ${i + 1}\n`);
+				lines[2] = `${line3}\n`;
+				lines[1994] = `${line1995}\n`;
+				const buf = Buffer.from(lines.join(""));
+				if (nulOffset >= 0) buf[nulOffset] = 0;
+				return buf;
+			};
+			writeFileSync(join(wt, "f.dat"), mk("base3", "base1995"));
+			await git(sh, ["add", "-A"]);
+			const base = (await git(sh, ["write-tree"])).stdout.trim();
+			writeFileSync(join(wt, "f.dat"), mk("theirs3", "base1995"));
+			await git(sh, ["add", "-A"]);
+			const theirs = (await git(sh, ["write-tree"])).stdout.trim();
+			writeFileSync(join(wt, "f.dat"), mk("base3", "ours1995"));
+			await git(sh, ["add", "-A"]);
+			const ours = (await git(sh, ["write-tree"])).stdout.trim();
+			const m = await git(sh, ["merge-tree", "--write-tree", `--merge-base=${base}`, ours, theirs]);
+			return { late: m.code === 0 && !/Cannot merge binary/.test(m.stdout + m.stderr), lateMergeCode: m.code };
+		};
+		const early = await build(156, "p16a");
+		const late = await build(39026, "p16b");
+		check("16 NUL 在前 8000 字节内 → 冲突（git 认得出二进制）", early.lateMergeCode === 1, `code=${early.lateMergeCode}`);
+		check(
+			"16 NUL 在 8000 字节之后 → git 静默行级合并（所以必须自己判二进制）",
+			late.late === true,
+			`code=${late.lateMergeCode}`,
+		);
 	}
 
 	// ================= 汇总 =================
