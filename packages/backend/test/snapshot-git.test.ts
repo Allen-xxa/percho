@@ -176,6 +176,32 @@ describe("snapshot-git：影子库基本机制", () => {
 		expect(raw.stderr).toContain("does not have a commit checked out");
 	});
 
+	it("深层嵌套仓库（无 commit）也被排除：父目录里有普通文件", async () => {
+		if (!(await gitAvail())) return;
+		// review BUG 1：`--directory` 会把整个 `src/` 折叠成一个条目，导致 `src/vendor` 漏检。
+		// 去掉 `--directory` 后 git 逐个列未跟踪文件，只把真嵌套仓库折叠成 `src/vendor/`。
+		mkdirSync(join(repo.workTree, "src", "vendor"), { recursive: true });
+		writeFileSync(join(repo.workTree, "src", "app.ts"), "export {};\n");
+		writeFileSync(join(repo.workTree, "src", "vendor", "v.txt"), "v\n");
+		await rawGit(null, ["init", "-q", join(repo.workTree, "src", "vendor")]);
+
+		const result = await snapshotTree(repo, { skipOverBytes: SKIP_OVER });
+		expect(result.skipped).toContain("src/vendor");
+		expect([...(await listTree(repo, result.treeOid)).keys()].sort()).toEqual(["src/app.ts"]);
+	});
+
+	it("多层深层嵌套仓库（无 commit）同时被排除", async () => {
+		if (!(await gitAvail())) return;
+		mkdirSync(join(repo.workTree, "a", "b", "c", "vendor2"), { recursive: true });
+		writeFileSync(join(repo.workTree, "a", "b", "c", "keep.txt"), "k\n");
+		writeFileSync(join(repo.workTree, "a", "b", "c", "vendor2", "v.txt"), "v\n");
+		await rawGit(null, ["init", "-q", join(repo.workTree, "a", "b", "c", "vendor2")]);
+
+		const result = await snapshotTree(repo, { skipOverBytes: SKIP_OVER });
+		expect(result.skipped).toContain("a/b/c/vendor2");
+		expect([...(await listTree(repo, result.treeOid)).keys()].sort()).toEqual(["a/b/c/keep.txt"]);
+	});
+
 	it("嵌套仓库（有 commit）的 gitlink 也会被剔除", async () => {
 		if (!(await gitAvail())) return;
 		const nested = join(repo.workTree, "vendor");
@@ -196,6 +222,21 @@ describe("snapshot-git：影子库基本机制", () => {
 		expect(raw.code).toBe(0);
 		const staged = await runGit(repo, ["ls-files", "-s"]);
 		expect(staged.stdout).toContain("160000");
+	});
+
+	it("深层嵌套仓库（有 commit）的 gitlink 也被剔除", async () => {
+		if (!(await gitAvail())) return;
+		const nested = join(repo.workTree, "src", "vendor");
+		mkdirSync(nested, { recursive: true });
+		writeFileSync(join(nested, "v.txt"), "v\n");
+		await rawGit(null, ["-C", nested, "init", "-q"]);
+		await rawGit(null, ["-C", nested, "add", "-A"]);
+		await rawGit(null, ["-C", nested, "commit", "-q", "-m", "init"]);
+		writeFileSync(join(repo.workTree, "src", "app.ts"), "export {};\n");
+
+		const result = await snapshotTree(repo, { skipOverBytes: SKIP_OVER });
+		expect(result.skipped).toContain("src/vendor");
+		expect([...(await listTree(repo, result.treeOid)).keys()].sort()).toEqual(["src/app.ts"]);
 	});
 
 	it("超大文件被剔除但磁盘文件不动", async () => {
@@ -309,7 +350,11 @@ describe("snapshot-git：二进制判定", () => {
 		writeFileSync(join(repo.workTree, "img.png"), "not really a png\n");
 		writeFileSync(join(repo.workTree, "doc.md"), "# text\n");
 		const tree = await snap();
-		const bins = await detectBinaryPaths(repo, tree, ["img.png", "doc.md"]);
+		const bins = await detectBinaryPaths(repo, {
+			fromTree: tree,
+			oursTree: tree,
+			paths: ["img.png", "doc.md"],
+		});
 		expect(bins.has("img.png")).toBe(true);
 		expect(bins.has("doc.md")).toBe(false);
 	});
@@ -321,7 +366,11 @@ describe("snapshot-git：二进制判定", () => {
 		writeFileSync(join(repo.workTree, "blobfile"), buf);
 		writeFileSync(join(repo.workTree, "plain"), "plain text\n");
 		const tree = await snap();
-		const bins = await detectBinaryPaths(repo, tree, ["blobfile", "plain"]);
+		const bins = await detectBinaryPaths(repo, {
+			fromTree: tree,
+			oursTree: tree,
+			paths: ["blobfile", "plain"],
+		});
 		expect(bins.has("blobfile")).toBe(true);
 		expect(bins.has("plain")).toBe(false);
 	});
@@ -332,8 +381,28 @@ describe("snapshot-git：二进制判定", () => {
 		buf[39026] = 0;
 		writeFileSync(join(repo.workTree, "late.dat"), buf);
 		const tree = await snap();
-		const bins = await detectBinaryPaths(repo, tree, ["late.dat"]);
+		const bins = await detectBinaryPaths(repo, { fromTree: tree, oursTree: tree, paths: ["late.dat"] });
 		expect(bins.has("late.dat")).toBe(true);
+	});
+
+	it("numstat 分支真的在工作：两棵树之间变化的二进制会被抓到", async () => {
+		if (!(await gitAvail())) return;
+		// review BUG 2：原来传单个树（= tree 对工作区）恒为空，这一支是死代码。
+		// 现在传两棵树。为了证明是 numstat 在起作用（而不是全文查 NUL 兜底），
+		// 故意把 bin.dat 排除在 paths 之外 —— 全文扫描只遍历 paths。
+		const mk = (fill: number): Buffer => {
+			const b = Buffer.alloc(64, fill);
+			b[10] = 0;
+			return b;
+		};
+		writeFileSync(join(repo.workTree, "bin.dat"), mk(65));
+		writeFileSync(join(repo.workTree, "note.txt"), "note\n");
+		const t0 = await snap();
+		writeFileSync(join(repo.workTree, "bin.dat"), mk(66));
+		const t1 = await snap();
+		const bins = await detectBinaryPaths(repo, { fromTree: t0, oursTree: t1, paths: ["note.txt"] });
+		expect(bins.has("bin.dat")).toBe(true);
+		expect(bins.has("note.txt")).toBe(false);
 	});
 
 	it("二进制修复包是 GIT binary patch 且 0 个 NUL", async () => {

@@ -307,11 +307,16 @@ export interface SnapshotTreeResult {
  * **exit 128 直接失败**（`error: 'vendor/' does not have a commit checked out` /
  * `fatal: adding files failed`），不是「加进去再剔」。有 commit 的才会变成 `160000` gitlink。
  *
- * 用 `--directory` 让 git 把整个未跟踪目录折叠成一个条目（不用逐层走盘），
- * 再逐个验证是否真有 `.git`（普通目录也会被折叠，不能一概当仓库）。
+ * 用 `git ls-files -o --exclude-standard -z`（**不加 `--directory`**）：
+ * - 加 `--directory` 会把**整个未跟踪目录**折叠成一个条目（不管它是不是仓库），
+ *   于是 `src/vendor` 这种深层嵌套仓库会以 `src/` 的形式出现，`stat("src/.git")` 不存在
+ *   → 被误判为普通目录 → `git add -A` 直接 128 失败。
+ * - 不加时 git 逐个列出未跟踪文件，只把**真正的嵌套仓库**折叠成 `dir/`（带尾斜杠），
+ *   所以 `endsWith("/")` 过滤依然成立。实测代价：本仓 25ms/174B → 30ms/36.9KB（index 全空的最坏情况）。
+ * - 仍然 `stat(<dir>/.git)` 兜底，防 git 折叠了别的东西。
  */
 async function findNestedRepos(repo: ShadowRepo): Promise<string[]> {
-	const listed = await runGit(repo, ["ls-files", "-o", "--exclude-standard", "--directory", "-z"]);
+	const listed = await runGit(repo, ["ls-files", "-o", "--exclude-standard", "-z"]);
 	if (listed.code !== 0) return [];
 	const found: string[] = [];
 	for (const entry of listed.stdout.split("\0")) {
@@ -465,14 +470,15 @@ export async function readBlob(repo: ShadowRepo, sha: string): Promise<Buffer> {
  * 2. `git diff --numstat` 输出 `-` 的路径（覆盖白名单之外、无扩展名的二进制）
  * 3. 兜底：对剩余候选读 blob **全文**查 NUL（不是只看前 8000 字节）
  *
- * @param oursTree 当前工作区快照树（numstat 的右侧）
- * @param paths 候选路径（相对 cwd 的 posix 形式）
+ * @param opts.fromTree 比较基线（窗口起点，通常是 `base`）
+ * @param opts.oursTree 当前工作区快照树
+ * @param opts.paths 候选路径（相对 cwd 的 posix 形式）
  */
 export async function detectBinaryPaths(
 	repo: ShadowRepo,
-	oursTree: string,
-	paths: string[],
+	opts: { fromTree: string; oursTree: string; paths: string[] },
 ): Promise<Set<string>> {
+	const { fromTree, oursTree, paths } = opts;
 	const result = new Set<string>();
 	if (paths.length === 0) return result;
 
@@ -487,7 +493,9 @@ export async function detectBinaryPaths(
 	}
 
 	// 2) numstat 的 `-`
-	const numstat = await runGit(repo, ["diff", "--numstat", "-z", oursTree]);
+	// ❗ 必须传**两棵树**：`git diff <tree>` 是「tree 对工作区」，而本函数调用时工作区刚被
+	// `snapshotTree` 拍过（内容与 oursTree 完全一致）→ 只传一个树时输出恒为空，这一支就是死代码。
+	const numstat = await runGit(repo, ["diff", "--numstat", "-z", fromTree, oursTree]);
 	if (numstat.code === 0) {
 		// -z 格式：`<add>\t<del>\t<path>\0`（rename 时多一段 path\0，此处不关心）
 		for (const chunk of numstat.stdout.split("\0")) {
@@ -554,8 +562,17 @@ export async function buildFilteredTree(
 }
 
 export interface MergeResult {
+	/** 合并树 OID；`failed` 为 true 时为空串 */
 	treeOid: string;
+	/** 冲突路径（已去重） */
 	conflicts: string[];
+	/**
+	 * `merge-tree` 非预期失败（缺对象 / 超时 / git 报错），**不是冲突**。
+	 * 冲突是预期分支（`failed === false` 且 `conflicts` 非空）。
+	 * 调用方必须检查这个标志 —— 否则会把「失败」当「无冲突」继续，
+	 * 最后在 `checkoutTree("")` 抛一个与真实原因无关的错。
+	 */
+	failed: boolean;
 }
 
 /**
@@ -596,9 +613,9 @@ export async function mergeTrees(
 	}
 	// 二进制冲突时 merge-tree 会把原因写到 stderr（"Cannot merge binary files"），此时 stdout 可能没有 tree
 	if (!/^[0-9a-f]{40,64}$/.test(treeOid)) {
-		return { treeOid: "", conflicts: conflicts.length > 0 ? conflicts : [] };
+		return { treeOid: "", conflicts, failed: conflicts.length === 0 };
 	}
-	return { treeOid, conflicts };
+	return { treeOid, conflicts, failed: false };
 }
 
 /** 落地：`read-tree -u --reset`。**调用前 index 必须停在目标树的父状态**（调用方负责） */
