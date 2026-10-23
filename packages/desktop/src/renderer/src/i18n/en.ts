@@ -201,7 +201,7 @@ export const en: Messages = {
 	message: {
 		copy: "Copy",
 		copied: "Copied",
-		recall: "Recall to composer",
+		recall: "Recall chat and code",
 		fork: "Fork from here",
 		skillInvocation: "Skill · {name}",
 		showMore: "Show more",
@@ -749,6 +749,8 @@ export const en: Messages = {
 		sessionOpenFailed: "Failed to open session",
 		forkFailed: "Failed to fork session",
 		recallFailed: "Failed to recall message",
+		recallConflict: "Could not revert code — repair patch placed in the composer",
+		recallDeleted: "Recall deleted these files",
 		retryFailed: "Retry was not accepted",
 		modelsLoadFailed: "Failed to load models",
 		subagentReturnUnavailable: "Cannot return: parent session file is missing",

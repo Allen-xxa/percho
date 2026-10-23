@@ -197,7 +197,7 @@ export const zh = {
 	message: {
 		copy: "复制",
 		copied: "已复制",
-		recall: "撤回并放回输入框",
+		recall: "撤回对话和代码",
 		fork: "从此处分叉",
 		skillInvocation: "Skill · {name}",
 		showMore: "显示更多",
@@ -726,6 +726,8 @@ export const zh = {
 		sessionOpenFailed: "打开会话失败",
 		forkFailed: "分叉会话失败",
 		recallFailed: "撤回消息失败",
+		recallConflict: "代码撤不回来了，已把修复内容放进输入框",
+		recallDeleted: "撤回时删掉了这些文件",
 		retryFailed: "重试未受理",
 		modelsLoadFailed: "加载模型列表失败",
 		subagentReturnUnavailable: "无法返回父会话：找不到父会话文件",

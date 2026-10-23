@@ -404,6 +404,15 @@ function commitSessionState(
 
 // Host action writes use the explicit commit; Zustand's public setState is not wrapped.
 const set = commitSessionState;
+/**
+ * 撤回冲突时给模型的修复指令（spec 6.5）：把 patch 原样贴进输入框，用户看一眼就能发。
+ * 不做任何加工 —— 冲突文件是 git 判定的，模型的活是照着 patch 把代码改回去。
+ */
+function buildRepairPrompt(patch: string): string {
+	const trimmed = patch.trim();
+	if (!trimmed) return "我撤回了上一轮，但有些改动撤不回来了，请检查工作区是否还有需要还原的内容。";
+	return `我撤回了上一轮，但下面这些改动撤不回来了，请按此改回去：\n\n\`\`\`diff\n${trimmed}\n\`\`\``;
+}
 export const useSessionsStore = create<SessionsStore>((_set, get) => ({
 	sessions: [],
 	activeSessionId: null,
@@ -705,6 +714,28 @@ export const useSessionsStore = create<SessionsStore>((_set, get) => ({
 		if (!activeSessionId) return;
 		try {
 			const recalled = await getPi().recallMessage({ sessionId: activeSessionId, ref });
+
+			// 代码撤不回来时对话没动（后端在动对话之前就返回了）：不回填原文、不重建消息流，
+			// 只把冲突说清楚 + 修复包放进输入框（spec 6.5）。unavailable 静默降级。
+			if (!recalled.recalled) {
+				if (recalled.code?.status === "conflict") {
+					pushToast("warning", "toast.recallConflict", recalled.code.conflicts?.join(", "));
+					const patch = recalled.code.repairPatch ?? "";
+					useDraftStore.getState().updateDraft(activeSessionId, (d) =>
+						appendDraftInput(d, {
+							document: composerDocumentFromText(buildRepairPrompt(patch)),
+							images: [],
+						}),
+					);
+					if (get().activeSessionId === activeSessionId)
+						window.dispatchEvent(new CustomEvent(COMPOSER_FOCUS_EVENT, { detail: { moveToEnd: true } }));
+				}
+				return;
+			}
+			// spec 6.5：成功路径**不列**类别 B 清单，只说删了哪些文件（这是用户唯一无法从界面看出来的结果）
+			if (recalled.code?.status === "reverted" && recalled.code.deleted.length > 0) {
+				pushToast("info", "toast.recallDeleted", recalled.code.deleted.join(", "));
+			}
 			// 内容回填草稿：已有草稿文本时换行拼接（与排队取回一致），图片追加在尾部
 			useDraftStore.getState().updateDraft(activeSessionId, (d) =>
 				appendDraftInput(d, {
