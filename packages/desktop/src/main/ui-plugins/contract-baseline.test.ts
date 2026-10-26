@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { KNOWN_UI_SLOTS, UI_SLOTS } from "@percho/shared";
 import { transform } from "esbuild";
 import * as React from "react";
@@ -389,7 +390,9 @@ describe("V07 complete plugin contract guard (no import of side-effectful host A
 				fixture,
 				`import * as A from "@percho/plugin-api";\n${aliases.join("\n")}\n${assetChecks.join("\n")}\ndeclare const tool: A.UIToolCall; declare const run: A.SubagentRunUi;\nconst end: number | undefined = tool.endedAt; const diff: string | undefined = tool.diff;\nconst thinking: string | undefined = run.thinkingLevel; const store: unknown = A.useProjectsStore;`,
 			);
-			const declaration = new URL("../../../resources/ui-plugins/percho-ui.d.ts", import.meta.url).pathname;
+			const declaration = fileURLToPath(
+				new URL("../../../resources/ui-plugins/percho-ui.d.ts", import.meta.url),
+			);
 			const program = ts.createProgram([fixture, declaration], {
 				strict: true,
 				noEmit: true,

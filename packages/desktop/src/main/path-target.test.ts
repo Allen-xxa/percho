@@ -1,12 +1,16 @@
 // @vitest-environment node
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, normalize, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { cleanPathText, resolveExistingPath, resolvePathTarget } from "./path-target";
 
 /** 路径解析（issue #55 ④）：模型给的路径形态千奇百怪，这里把每类都钉住 */
 
 const CWD = "/Users/me/proj";
+/** 期望值统一走 node:path 的平台规则：同一段断言在 POSIX 与 Windows 上都得成立
+ *  （Windows 下 `/Users/x` 是「当前盘符下的根路径」，`normalize` 会给出 `\\Users\\x`） */
+const asPath = (posix: string) => normalize(posix);
 
 describe("cleanPathText", () => {
 	it("剥成对包裹符（反引号/引号/尖括号/括号/方括号）", () => {
@@ -37,8 +41,8 @@ describe("cleanPathText", () => {
 
 describe("resolvePathTarget", () => {
 	it("绝对路径原样（normalize 掉 ./ 与 ..）", () => {
-		expect(resolvePathTarget("/Users/me/proj/src/a.ts", CWD)).toBe("/Users/me/proj/src/a.ts");
-		expect(resolvePathTarget("/Users/me/proj/./src/../src/a.ts", CWD)).toBe("/Users/me/proj/src/a.ts");
+		expect(resolvePathTarget("/Users/me/proj/src/a.ts", CWD)).toBe(asPath("/Users/me/proj/src/a.ts"));
+		expect(resolvePathTarget("/Users/me/proj/./src/../src/a.ts", CWD)).toBe(asPath("/Users/me/proj/src/a.ts"));
 	});
 
 	it("相对路径以会话 cwd 为基准（cwd 非法/缺省时退回进程 cwd）", () => {
@@ -57,15 +61,21 @@ describe("resolvePathTarget", () => {
 	});
 
 	it("file:// URL（含中文与空格的 percent-encoding）", () => {
-		expect(resolvePathTarget("file:///Users/me/proj/a%20b.ts", CWD)).toBe("/Users/me/proj/a b.ts");
-		expect(resolvePathTarget("file:///Users/me/%E4%B8%AD%E6%96%87.md", CWD)).toBe("/Users/me/中文.md");
-		expect(resolvePathTarget("file:///Users/me/proj/a.ts:12", CWD)).toBe("/Users/me/proj/a.ts");
+		// URL 用 pathToFileURL 生成：手写 `file:///Users/...` 在 Windows 上不是合法 file URL
+		// （fileURLToPath 抛 ERR_INVALID_FILE_URL_PATH），测的就不是「本平台 URL 能不能吃」了
+		const spaced = resolve("/Users/me/proj/a b.ts");
+		const chinese = resolve("/Users/me/中文.md");
+		expect(resolvePathTarget(pathToFileURL(spaced).href, CWD)).toBe(spaced);
+		expect(resolvePathTarget(pathToFileURL(chinese).href, CWD)).toBe(chinese);
+		expect(resolvePathTarget(`${pathToFileURL(resolve("/Users/me/proj/a.ts")).href}:12`, CWD)).toBe(
+			resolve("/Users/me/proj/a.ts"),
+		);
 	});
 
 	it("纯路径里的 percent-encoding 也解码；非法转义保持原样", () => {
-		expect(resolvePathTarget("/Users/me/a%20b.ts", CWD)).toBe("/Users/me/a b.ts");
-		expect(resolvePathTarget("/Users/me/100%25.ts", CWD)).toBe("/Users/me/100%.ts");
-		expect(resolvePathTarget("/Users/me/100% 完成.md", CWD)).toBe("/Users/me/100% 完成.md");
+		expect(resolvePathTarget("/Users/me/a%20b.ts", CWD)).toBe(asPath("/Users/me/a b.ts"));
+		expect(resolvePathTarget("/Users/me/100%25.ts", CWD)).toBe(asPath("/Users/me/100%.ts"));
+		expect(resolvePathTarget("/Users/me/100% 完成.md", CWD)).toBe(asPath("/Users/me/100% 完成.md"));
 	});
 
 	it("空路径/纯包裹符抛错（不静默当成 cwd）", () => {

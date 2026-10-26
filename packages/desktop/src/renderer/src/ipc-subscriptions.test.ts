@@ -157,7 +157,9 @@ function compileFixture(body: string) {
 			allowImportingTsExtensions: true,
 		});
 		return ts.getPreEmitDiagnostics(program).map((diagnostic) => ({
-			file: diagnostic.file?.fileName === file ? "fixture" : diagnostic.file?.fileName,
+			// TypeScript 把文件名归一成正斜杠，不能与 join 出来的平台路径直接比；
+			// 用 resolve 归一后比较（大小写不敏感的文件系统上仍按字面比，但 fixture 由我们生成，不会大小写不一）
+			file: diagnostic.file && resolve(diagnostic.file.fileName) === resolve(file) ? "fixture" : diagnostic.file?.fileName,
 			line:
 				diagnostic.file && diagnostic.start !== undefined
 					? diagnostic.file.getLineAndCharacterOfPosition(diagnostic.start).line + 1
