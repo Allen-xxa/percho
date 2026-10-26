@@ -64,53 +64,73 @@ export function ErrorNote({
 		return list;
 	}, [error.actions, t]);
 
+	const retryAction = actions.find(({ action }) => action === "retry");
+	const secondaryActions = actions.filter(({ action }) => action !== "retry");
+
+	const handleAction = (action: string) => {
+		if (action === "retry" && sessionId) void retryFailedTurn(sessionId, cardId);
+		else if (action === "compact" && sessionId) void getPi().compact({ sessionId });
+		else if (action === "openSettings") useSettingsStore.getState().openWith();
+		else if (action === "copyDetail") void copyDetail();
+	};
+
 	return (
-		<details className="error-note drawer-details">
-			<summary>
-				<span className={`error-note-sev ${severityClass}`}>
-					<ErrorCircleIcon />
-				</span>
-				<span className="error-note-title truncate">
-					{t(error.titleKey as MessageKey, error.titleParams)}
-				</span>
-				<span className="error-note-meta">{meta}</span>
-				<span className="error-note-chev">
-					<ChevronRightIcon />
-				</span>
-			</summary>
-			<div className="error-note-body">
-				{error.detail && <pre className="error-note-detail">{error.detail}</pre>}
-				{error.hintKey && <p className="error-note-hint">{t(error.hintKey as MessageKey)}</p>}
-				<div className="error-note-actions">
-					{actions.map(({ action, label }) => (
-						<button
-							key={action}
-							type="button"
-							className={`error-note-act${action === "retry" ? " strong" : ""}`}
-							disabled={action === "retry" && (!retryAvailable || readOnly)}
-							onClick={() => {
-								if (action === "retry" && sessionId) void retryFailedTurn(sessionId, cardId);
-								else if (action === "compact" && sessionId) void getPi().compact({ sessionId });
-								else if (action === "openSettings") useSettingsStore.getState().openWith();
-								else if (action === "copyDetail") void copyDetail();
-							}}
-						>
-							{action === "retry" ? (
-								<RefreshIcon />
-							) : action === "openSettings" ? (
-								<GearIcon />
-							) : action === "copyDetail" ? (
-								<CopyIcon />
-							) : null}
-							{label}
-						</button>
-					))}
-					{error.detail && (
-						<span className={`error-note-copied${copied ? " on" : ""}`}>{t("error.copied")}</span>
+		<div className="error-note-wrap">
+			<details className="error-note drawer-details">
+				<summary>
+					<span className={`error-note-sev ${severityClass}`}>
+						<ErrorCircleIcon />
+					</span>
+					<span className="error-note-title truncate">
+						{t(error.titleKey as MessageKey, error.titleParams)}
+					</span>
+					<span className="error-note-meta">{meta}</span>
+					<span className="error-note-chev">
+						<ChevronRightIcon />
+					</span>
+				</summary>
+				<div className="error-note-body">
+					{error.detail && <pre className="error-note-detail">{error.detail}</pre>}
+					{error.hintKey && <p className="error-note-hint">{t(error.hintKey as MessageKey)}</p>}
+					{(secondaryActions.length > 0 || error.detail) && (
+						<div className="error-note-actions">
+							{secondaryActions.map(({ action, label }) => (
+								<button
+									key={action}
+									type="button"
+									className="error-note-act"
+									disabled={action === "retry" && (!retryAvailable || readOnly)}
+									onClick={() => handleAction(action)}
+								>
+									{action === "openSettings" ? (
+										<GearIcon />
+									) : action === "copyDetail" ? (
+										<CopyIcon />
+									) : null}
+									{label}
+								</button>
+							))}
+							{error.detail && (
+								<span className={`error-note-copied${copied ? " on" : ""}`}>{t("error.copied")}</span>
+							)}
+						</div>
 					)}
 				</div>
-			</div>
-		</details>
+			</details>
+			{retryAction && (
+				<div className="error-note-retry">
+					<button
+						type="button"
+						className="error-note-act strong whitespace-nowrap"
+						disabled={!retryAvailable || readOnly}
+						onClick={() => handleAction(retryAction.action)}
+					>
+						<RefreshIcon />
+						{retryAction.label}
+					</button>
+				</div>
+			)}
+		</div>
 	);
 }
 

@@ -20,11 +20,13 @@ import {
 import { useSessionsStore } from "../../stores/sessions";
 import { pushToast } from "../../stores/toasts";
 import { selectTranscript, useTranscriptStore } from "../../stores/transcript";
+import { useUiPreferencesStore } from "../../stores/ui-preferences";
 import { ImagePreviewOverlay } from "../chat/ImagePreview";
 import { ArrowUpIcon, PencilIcon, PlusIcon, StopIcon } from "../icons";
 import { AtMenu } from "./AtMenu";
 import { ComposerEditor, type ComposerEditorHandle } from "./ComposerEditor";
 import { ContextRing } from "./ContextRing";
+import { resolveComposerKey } from "./enter-key";
 import "./composer-editor.css";
 import { resolveDroppedFilePaths } from "./drop-files";
 import { ImageTray } from "./ImageTray";
@@ -56,6 +58,9 @@ export function Composer({ centered = false }: { centered?: boolean }) {
 	const activeSessionId = useSessionsStore((s) => s.activeSessionId);
 	/** 只读会话（subagent 产物检视）：输入/发送/图片全禁，模型与思考档位选择器置灰 */
 	const readOnly = useSessionReadOnly();
+	// 发送/换行键位都可配（设置 → 快捷键）；默认 Enter 发送、Shift+Enter 换行。
+	const sendChord = useUiPreferencesStore((s) => s.shortcutBindings["composer.send"]);
+	const newlineChord = useUiPreferencesStore((s) => s.shortcutBindings["composer.newline"]);
 	const cwd = useSessionsStore(selectActiveCwd);
 	/** 信任决策应答后递增：新会话页的斜杠菜单按新决策（信任与否）重拉命令 */
 	const trustVersion = useSessionsStore((s) => s.trustVersion);
@@ -288,7 +293,18 @@ export function Composer({ centered = false }: { centered?: boolean }) {
 				return;
 			}
 		}
-		if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+		// 发送/换行键位都可自由录制（默认 Enter 发送、Shift+Enter 换行）；
+		// 没被任何动作占用的 Enter 一律软换行——发送只认录下来的那个键位。
+		const keyAction = resolveComposerKey(e.nativeEvent, sendChord, newlineChord);
+		if (keyAction === "newline") {
+			// 显式走软换行：不让 Lexical 把 Ctrl/Alt+Enter 当成「新段落」（与 Shift+Enter 同一种换行）。
+			// 本处理器在捕获阶段、且在 defaultPrevented 时截断传播，Lexical 收不到这次 Enter。
+			e.preventDefault();
+			e.stopPropagation();
+			editorRef.current?.insertLineBreak();
+			return;
+		}
+		if (keyAction === "send") {
 			e.preventDefault();
 			void sendWhenReady();
 		}

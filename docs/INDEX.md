@@ -30,6 +30,7 @@
 | 消息事件、历史回放、轮次派生 | shared `transcript/`；backend `session/messages.ts`；renderer `stores/transcript.ts` |
 | 消息气泡、Markdown、Mermaid、工具卡 | renderer `components/chat/`；流式合流 `stores/event-conflator.ts` |
 | 输入、发送、停止、排队、斜杠与 @ 补全 | renderer `components/composer/`、`stores/drafts.ts`；backend `slash-commands.ts` |
+| 可配置快捷键（发送/换行） | shared `shortcuts.ts`；renderer `components/settings/ShortcutsPanel.tsx`、`stores/ui-preferences.ts` |
 | 图片附件与历史图资源 | renderer `lib/image-attachment.ts`、`lib/image-fit.ts`、`components/chat/history-image/`、`ImagePreview.tsx` |
 | 错误卡、分类、手动重试 | shared `errors.ts`、`transcript/llm-errors.ts`；renderer `stores/session-retry.ts`、`components/chat/ErrorNote.tsx` |
 | 轮次计时、文件变更、diff 侧栏 | shared `transcript/turn-*`；renderer `components/chat/TurnDiffChip.tsx`、`components/diff/` |
@@ -43,7 +44,7 @@
 | 设置页及按域加载 | renderer `components/settings/`、`stores/settings.ts`；新增分类入口 `SettingsDialog.tsx` |
 | UI 插件运行时与发布契约 | renderer `plugins/`；desktop `main/ui-plugins/`、`resources/ui-plugins/SPEC.md` |
 | 主题、字号、基础样式、文案 | renderer `styles/`、`stores/theme.ts`、`lib/typography.ts`、`i18n/`；字号档位在 shared `typography.ts` |
-| 窗口、退出、尺寸恢复、开发数据隔离 | desktop `main/window.ts`、`window-bounds.ts`、`dev-agent-dir.ts` |
+| 窗口、退出、尺寸恢复、单实例锁、数据目录（含验收隔离开关） | desktop `main/window.ts`、`window-bounds.ts`、`dev-agent-dir.ts`、`main/index.ts` |
 | 自动更新和诊断 | desktop `main/updater.ts`、`update-policy.ts`、`update-diagnostics.ts`、`build/update-diagnostics.nsh` |
 | 跨设备互联 | shared `lan.ts`；backend `lan/`；desktop `main/lan.ts`、`src/lan-web/` |
 | 日志、事件 trace 与崩溃 | backend `log.ts`、`session/trace*.ts`；desktop `main/renderer-watchdog.ts` |

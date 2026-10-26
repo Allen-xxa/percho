@@ -8,6 +8,7 @@ import {
 	$insertNodes,
 	$isRangeSelection,
 	HISTORY_PUSH_TAG,
+	INSERT_LINE_BREAK_COMMAND,
 } from "lexical";
 import {
 	type ClipboardEvent,
@@ -26,6 +27,12 @@ export interface ComposerEditorHandle {
 	focus: (position?: number | "end") => void;
 	replaceText: (start: number, end: number, text: string) => void;
 	insertReference: (start: number, end: number, reference: Exclude<ComposerPart, { type: "text" }>) => void;
+	/**
+	 * 光标处插入一个软换行（同一段落内的换行，不是空段落）。
+	 * 走 Lexical 自己的 INSERT_LINE_BREAK 处理器：换行就一种，不能因为修饰键不同
+	 * 而有时成软换行、有时成段落分隔。
+	 */
+	insertLineBreak: () => void;
 }
 
 interface Props {
@@ -75,6 +82,10 @@ export const ComposerEditor = forwardRef<ComposerEditorHandle, Props>(function C
 					else if (typeof position === "number") $selectComposerOffset(position);
 				});
 				entry.editor.focus();
+			},
+			insertLineBreak: () => {
+				// dispatchCommand 自己开 update；不开 HISTORY_PUSH_TAG —— 与 Shift+Enter 一致按原生粒度入历史
+				entry.editor.dispatchCommand(INSERT_LINE_BREAK_COMMAND, false);
 			},
 		}),
 		[entry],

@@ -3,8 +3,15 @@ import {
 	clampCodeFontSize,
 	clampSidebarWidth,
 	clampUiFontSize,
+	DEFAULT_SHORTCUT_BINDINGS,
+	type KeyChord,
 	type PermissionMode,
+	resolveShortcutBindings,
+	type ShortcutAction,
+	type ShortcutBindings,
 	SIDEBAR_DEFAULT_WIDTH,
+	sameChord,
+	toShortcutOverrides,
 	UI_FONT_SIZE_BASE,
 	type UiState,
 } from "@percho/shared";
@@ -21,6 +28,11 @@ interface UiPreferencesStore {
 	pinnedSessions: string[];
 	/** 按会话记住的权限模式（只存非 default；见 spec/permission-mode.md D7） */
 	sessionPermissionModes: Record<string, PermissionMode>;
+	/**
+	 * 新会话默认权限档位（设置 → 通用）：只是新会话/draft 的**起步值**。
+	 * 已开着的会话不受影响，也不覆盖 `sessionPermissionModes` 里的逐会话记忆。
+	 */
+	defaultPermissionMode: PermissionMode;
 	/** 顶栏显隐（设置页开关，默认开）：关闭后导航全落在左侧栏 */
 	/** 顶栏是否显示临时会话工作区胶囊（顶栏本身常驻；设置页「顶栏显示会话」） */
 	barSessionsVisible: boolean;
@@ -48,6 +60,11 @@ interface UiPreferencesStore {
 	uiFontSize: number;
 	/** 代码字号（px）：基准 12.5。影响代码块 / 内联 code / diff / mermaid 源码（界面文字不受影响） */
 	codeFontSize: number;
+	/**
+	 * 可配置快捷键（完整绑定表；动作注册表与键位校验在 shared `shortcuts.ts`）。
+	 * 选择器取单个动作的键位（对象引用稳，换键位 = 换对象）。
+	 */
+	shortcutBindings: ShortcutBindings;
 	/** 启动时从 ui-state.json 恢复（main.tsx 在 render 前 await，避免开关状态闪现） */
 	init: () => Promise<void>;
 	setCenterOrbEnabled: (enabled: boolean) => void;
@@ -79,12 +96,19 @@ interface UiPreferencesStore {
 	rememberPermissionMode: (sessionId: string, mode: PermissionMode) => void;
 	/** 删除会话时清掉它的权限模式记录（与 `unpin` 并列） */
 	forgetPermissionMode: (sessionId: string) => void;
+	/** 改新会话默认档位：只影响之后新建的会话（同值短路） */
+	setDefaultPermissionMode: (mode: PermissionMode) => void;
 	/** 记住上次项目目录（切会话/打开会话/建会话时由 sessions store 调；同值不重复写盘） */
 	setLastCwd: (cwd: string | null) => void;
 	/** 切换界面字号（脏值/越界在 clamp 里收口）；立即写 CSS 变量 + 落盘 */
 	setUiFontSize: (px: number) => void;
 	/** 切换代码字号：写 `--fs-code-scale`（内联 code / 代码块 / diff / mermaid）+ monaco 由 Markdown.tsx 传 options */
 	setCodeFontSize: (px: number) => void;
+	/**
+	 * 改一个动作的键位（`null` = 恢复出厂默认）：录不出来的键位、与另一个动作撞车的键位都由
+	 * `resolveShortcutBindings` 丢弃（等于不变），落盘只写与默认不同的动作（覆盖集）。
+	 */
+	setShortcutChord: (action: ShortcutAction, chord: KeyChord | null) => void;
 }
 
 /** 持久化补丁（失败只记日志：偏好丢失不影响使用，弹 toast 反而更吵） */
@@ -98,6 +122,7 @@ export const useUiPreferencesStore = create<UiPreferencesStore>((set, get) => ({
 	centerOrbEnabled: false,
 	pinnedSessions: [],
 	sessionPermissionModes: {},
+	defaultPermissionMode: "default",
 	barSessionsVisible: true,
 	sessionRailEnabled: false,
 	sidebarCollapsed: false,
@@ -110,6 +135,7 @@ export const useUiPreferencesStore = create<UiPreferencesStore>((set, get) => ({
 	lastCwd: null,
 	uiFontSize: UI_FONT_SIZE_BASE,
 	codeFontSize: CODE_FONT_SIZE_BASE,
+	shortcutBindings: DEFAULT_SHORTCUT_BINDINGS,
 
 	init: async () => {
 		const saved = await getPi()
@@ -121,6 +147,7 @@ export const useUiPreferencesStore = create<UiPreferencesStore>((set, get) => ({
 			centerOrbEnabled: saved?.centerOrbEnabled ?? false,
 			pinnedSessions: saved?.pinnedSessions ?? [],
 			sessionPermissionModes: saved?.sessionPermissionModes ?? {},
+			defaultPermissionMode: saved?.defaultPermissionMode ?? "default",
 			barSessionsVisible: saved?.barSessionsVisible ?? true,
 			sessionRailEnabled: saved?.sessionRailEnabled ?? false,
 			sidebarCollapsed: saved?.sidebarCollapsed ?? false,
@@ -131,6 +158,7 @@ export const useUiPreferencesStore = create<UiPreferencesStore>((set, get) => ({
 			lastCwd: saved?.lastCwd ?? null,
 			uiFontSize,
 			codeFontSize,
+			shortcutBindings: resolveShortcutBindings(saved?.shortcuts),
 		});
 		// **首帧前生效**：main.tsx 在 render 前 await init，所以这里写完变量才画第一帧，不会闪一下默认字号
 		applyFontScales(uiFontSize, codeFontSize);
@@ -171,6 +199,17 @@ export const useUiPreferencesStore = create<UiPreferencesStore>((set, get) => ({
 		set({ codeFontSize: next });
 		applyFontScales(get().uiFontSize, next);
 		persistPatch({ codeFontSize: next });
+	},
+
+	setShortcutChord: (action, chord) => {
+		const overrides = toShortcutOverrides(get().shortcutBindings);
+		if (chord) overrides[action] = chord;
+		else delete overrides[action];
+		const next = resolveShortcutBindings(overrides);
+		// 同值短路：录到已生效的键位，或录不出来的值（无修饰键）被归一化回原值，都不白写一次盘
+		if (sameChord(next[action], get().shortcutBindings[action])) return;
+		set({ shortcutBindings: next });
+		persistPatch({ shortcuts: toShortcutOverrides(next) });
 	},
 
 	toggleSidebarCollapsed: () => {
@@ -239,5 +278,11 @@ export const useUiPreferencesStore = create<UiPreferencesStore>((set, get) => ({
 		delete next[sessionId];
 		set({ sessionPermissionModes: next });
 		persistPatch({ sessionPermissionModes: next });
+	},
+
+	setDefaultPermissionMode: (mode) => {
+		if (get().defaultPermissionMode === mode) return;
+		set({ defaultPermissionMode: mode });
+		persistPatch({ defaultPermissionMode: mode });
 	},
 }));

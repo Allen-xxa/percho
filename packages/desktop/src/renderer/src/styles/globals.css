@@ -1941,11 +1941,22 @@ code {
    ============================================================ */
 
 /* ---- 会话内错误条（<details> 折叠卡；抽屉动画复用 .drawer-details） ---- */
+.error-note-wrap {
+	display: flex;
+	align-items: flex-start;
+	gap: 4px;
+}
 .error-note {
+	min-width: 0;
+	flex: 1;
 	background: var(--color-surface);
 	border-radius: 12px;
 	box-shadow: var(--shadow-soft);
 	overflow: hidden;
+}
+.error-note-retry {
+	flex: none;
+	padding-top: 5px;
 }
 .error-note summary {
 	display: flex;

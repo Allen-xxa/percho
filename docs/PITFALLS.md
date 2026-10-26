@@ -13,6 +13,7 @@
 | 流式白屏、界面冻结、截图空白、点击静默落空 | [UI 调试](ui-debugging.md)；检查 console/trace 后重放 |
 | 浮层裁剪、横向偷跑、字号不跟随 | [UI 规范](ui.md) 的浮层与字号 |
 | 改代码没生效、HMR 异常、CDP 连到旧实例 | [UI 调试](ui-debugging.md) 的实例确认 |
+| dev 与安装版互相抢锁、`ui-state.json` 写 EPERM、dev 里看不到自己的会话 | [UI 调试](ui-debugging.md) 的数据目录与隔离 |
 | 本地包仍是旧界面、preload/二进制加载失败 | [构建发布](build-release.md) |
 | 撤回后代码没回去、报成功但文件没变、提交单独 checkout 编译不过 | 快照与回退见 [架构](architecture.md) 的数据归属；提交自洽性见 [CONTRIBUTING](../CONTRIBUTING.md) 的 Project conventions |
 | Windows 更新报“无法关闭”、旧卸载器失败 | [Windows 更新诊断](WINDOWS-UPDATES.md) |

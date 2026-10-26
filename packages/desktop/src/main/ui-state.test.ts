@@ -367,3 +367,81 @@ describe("字号档位（uiFontSize / codeFontSize）", () => {
 		expect(state?.codeFontSize).toBe(14);
 	});
 });
+
+describe("shortcuts 归一化（可配置快捷键，只存与出厂默认不同的覆盖项）", () => {
+	it("缺字段/旧文件 → 空覆盖集（全部走出厂默认）", async () => {
+		writeFileSync(file(), "{}");
+		expect((await loadUiState())?.shortcuts).toEqual({});
+	});
+
+	it("脏值不炸启动：非对象、未知动作、录不出来的键位、与别的动作撞车的键位一律丢弃", async () => {
+		for (const raw of [
+			'{"shortcuts":"x"}',
+			'{"shortcuts":[]}',
+			'{"shortcuts":null}',
+			// 裸字母会把输入抢走
+			'{"shortcuts":{"composer.newline":{"key":"k"}}}',
+			// 裸 Enter 已经是发送的，换行抢不走（两个动作键位互斥）
+			'{"shortcuts":{"composer.newline":{"key":"enter"}}}',
+			'{"shortcuts":{"composer.newline":{"key":"control","ctrl":true}}}',
+			'{"shortcuts":{"composer.nope":{"key":"enter","ctrl":true}}}',
+		]) {
+			writeFileSync(file(), raw);
+			expect((await loadUiState())?.shortcuts, raw).toEqual({});
+		}
+	});
+
+	it("两个动作互换习惯（Ctrl+Enter 发送 / Enter 换行）能存能读", async () => {
+		writeFileSync(file(), "{}");
+		await saveUiState({
+			shortcuts: { "composer.send": { key: "enter", ctrl: true }, "composer.newline": { key: "enter" } },
+		});
+		expect((await loadUiState())?.shortcuts).toEqual({
+			"composer.send": { key: "enter", ctrl: true },
+			"composer.newline": { key: "enter" },
+		});
+	});
+
+	it("保存后读回：覆盖项保留，键位对象不带多余字段", async () => {
+		writeFileSync(file(), "{}");
+		await saveUiState({ shortcuts: { "composer.newline": { key: "Enter", ctrl: true } } });
+		expect((await loadUiState())?.shortcuts).toEqual({ "composer.newline": { key: "enter", ctrl: true } });
+	});
+
+	it("显式改回出厂默认 → 归一化成空覆盖集（文件不会越用越大）", async () => {
+		writeFileSync(
+			file(),
+			JSON.stringify({ shortcuts: { "composer.newline": { key: "enter", shift: true } } }),
+		);
+		expect((await loadUiState())?.shortcuts).toEqual({});
+	});
+
+	it("补丁浅合并：改快捷键不影响其它字段，反之亦然", async () => {
+		await saveUiState({ pinnedSessions: ["s1"] });
+		await saveUiState({ shortcuts: { "composer.newline": { key: "enter", alt: true } } });
+		await saveUiState({ lastCwd: "/work/gamma" });
+		const state = await loadUiState();
+		expect(state?.shortcuts).toEqual({ "composer.newline": { key: "enter", alt: true } });
+		expect(state?.pinnedSessions).toEqual(["s1"]);
+		expect(state?.lastCwd).toBe("/work/gamma");
+	});
+});
+
+describe("defaultPermissionMode 白名单（新会话默认权限档位）", () => {
+	it("缺字段 / 脏值 → default（等于历史行为）", async () => {
+		for (const raw of [
+			"{}",
+			'{"defaultPermissionMode":"root"}',
+			'{"defaultPermissionMode":3}',
+			'{"defaultPermissionMode":null}',
+		]) {
+			writeFileSync(file(), raw);
+			expect((await loadUiState())?.defaultPermissionMode, raw).toBe("default");
+		}
+	});
+
+	it("fullAccess 原样保留，写一次能读回", async () => {
+		await saveUiState({ defaultPermissionMode: "fullAccess" });
+		expect((await loadUiState())?.defaultPermissionMode).toBe("fullAccess");
+	});
+});

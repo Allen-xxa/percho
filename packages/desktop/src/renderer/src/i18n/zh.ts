@@ -333,6 +333,7 @@ export const zh = {
 		category: {
 			general: "通用",
 			appearance: "外观",
+			shortcuts: "快捷键",
 			models: "模型",
 			skills: "Skills",
 			mcp: "MCP",
@@ -342,6 +343,21 @@ export const zh = {
 		},
 		language: "语言",
 		languageHint: "默认跟随系统语言",
+		// 快捷键：动作名/说明在这里，键位文案由 shared `formatChord` 拼（键名不进 i18n）
+		shortcuts: {
+			composer: "输入框",
+			composerHint: "发送与换行的键位都能自己录（默认 Enter 发送、Shift+Enter 换行）；两者不能是同一个键位。",
+			send: "发送",
+			sendHint: "发送当前输入。录成 Ctrl+Enter 就变成「Enter 换行、Ctrl+Enter 发送」。",
+			newline: "换行",
+			newlineHint: "只换行、不发送。点一下直接按组合键即可改，立即生效。",
+			record: "录制「{key}」快捷键",
+			recording: "按下组合键…",
+			recordHint: "Esc 取消",
+			needModifier: "至少带一个修饰键（Ctrl / Alt / Shift），或单独用 Enter",
+			conflict: "已被「{key}」占用，请先改那一个",
+			reset: "恢复默认（{key}）",
+		},
 		appearance: {
 			tabBasics: "基础",
 			tabUiPlugins: "UI 插件",
@@ -376,6 +392,10 @@ export const zh = {
 				"默认开启。按水位线把到龄的工具输出蒸发为带恢复指令的占位符（如「输出已淘汰，可用相同参数重读」）：60% 起截断工具输出、85% 起淘汰为占位；零 LLM 调用、对话原文保留、会话文件不动。切换后无需重开会话。",
 			off: "关闭全部上下文管理：不做主动压缩/蒸发，依赖 SDK 在接近窗口上限时的原生压缩兜底。长会话可能中断等待压缩。",
 		},
+		defaultPermission: "新会话权限档位",
+		defaultPermissionHint:
+			"新建会话（含新会话草稿）的起步档位：已打开的会话不受影响，仍可在输入框的权限按钮里单独切换。",
+		defaultPermissionWarn: "新会话将不再弹出审批，高危操作只写审计留痕。",
 		channelWatch: "跨会话频道协作（channel-watch）",
 		channelWatchHint:
 			"会话订阅频道后自动监听 .local/agent-work/channel/<主题>/ 的文件更新，另一会话写入时唤醒本会话查收（按 HANDOFF.md 沟通协议）。订阅经 appendEntry 持久化，重开会话自动恢复；内置防环保护。默认开启，对已信任项目完全生效。",

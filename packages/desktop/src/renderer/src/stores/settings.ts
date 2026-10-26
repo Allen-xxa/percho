@@ -20,6 +20,7 @@ import { pushToast } from "./toasts";
 export type SettingsCategory =
 	| "general"
 	| "appearance"
+	| "shortcuts"
 	| "models"
 	| "skills"
 	| "mcp"
@@ -371,6 +372,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
 				void get().refreshLanStatus();
 				break;
 			case "appearance":
+			case "shortcuts":
 			case "mcp":
 			case "about":
 				break;

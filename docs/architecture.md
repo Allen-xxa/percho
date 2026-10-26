@@ -54,8 +54,8 @@ UI 插件的槽位/区域标识以 shared `ui-plugins.ts` 为单源。新增对�
 
 ## 用户数据与安全
 
-正式 agent 数据在 `~/.pi/agent/`，与 CLI 共享；开发/预览通过 `main/dev-agent-dir.ts` 隔离到 `~/.pi/agent-dev/`，Electron userData 使用 `-dev` 后缀。具体开发路径与实例管理见 [UI 调试](ui-debugging.md)。
+正式 agent 数据在 `~/.pi/agent/`，与 CLI 共享，**只属于安装版和 CLI**。dev / 预览 / 测试**默认读写隔离副本**（`~/.pi/agent-dev/` + userData 加 `-dev` 后缀），路径逻辑见 `main/dev-agent-dir.ts`：dev 会写假会话、整份覆盖 `ui-state.json`、改 `settings.json`，与真实数据共用一套就等于拿用户数据当夹具。隔离的附带收益是单实例锁按 userData 划分，dev 与安装版是两把不同的锁，可以同时运行。需要看真实会话/记忆/AGENTS.md 时显式设 `PERCHO_SHARED_DEV_DATA=1` 退回正式目录（此时与安装版互斥）。具体开发路径、启动脚本与实例管理见 [UI 调试](ui-debugging.md)。
 
-权限模式属于会话，不是改写全局权限规则；第三方扩展的通用 confirm 不是工具授权。MCP/第三方工具无只读声明时不能默认放行，求值链以 backend `permissions/` 为准。
+权限模式属于会话，不是改写全局权限规则（`fullAccess` 只降级本会话的判定并留审计）；新会话的**起步档位**由设置 → 通用决定（`ui-state.json` 的 `defaultPermissionMode`），逐会话记忆优先于它。第三方扩展的通用 confirm 不是工具授权。MCP/第三方工具无只读声明时不能默认放行，求值链以 backend `permissions/` 为准。
 
 凭证不写入文档、日志或测试夹具；重放和验收使用隔离数据，不把正式目录当可变测试环境。

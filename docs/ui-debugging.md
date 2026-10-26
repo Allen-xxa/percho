@@ -4,14 +4,17 @@
 
 ## 启动与确认实例
 
-在仓库根目录准备 `.local/tmp/<任务>/` 存日志、截图和夹具。启动：
+在仓库根目录准备 `.local/tmp/<任务>/` 存日志、截图和夹具。**启动统一用脚本**，它们会处理数据目录、lan-web 产物、端口占用和退出清理：
 
-```bash
-cd packages/desktop
-npx electron-vite dev -- --remote-debugging-port=9224
+```powershell
+.\scripts\dev.ps1                 # 隔离数据 + CDP 9224（开发 / 测试 / 验收默认）
+.\scripts\dev-shared.ps1          # 真实数据 + CDP 9224（看真实会话，需先退出安装版）
+.\scripts\dev.ps1 -Port 9333 -Inspector
 ```
 
-不要改成 `npm run dev -- --remote-debugging-port=9224`：npm 会吞参数。需要 main inspector 的脚本还要按脚本头加入 `--inspect=9229`。
+`dev-shared.ps1` 只是把 `dev.ps1 -Shared` 写死成独立文件 —— 双击 / 快捷方式指向 `.ps1` 时附加参数不可靠，需要「一键开真实数据」时用它。
+
+不要改成 `npm run dev -- --remote-debugging-port=9224`：npm 会吞参数。手工启动时用 `npx electron-vite dev -- --remote-debugging-port=9224`，需要 main inspector 再按脚本头加入 `--inspect=9229`。
 
 1. 启动前检查目标端口，记录本次进程 PID；启动后确认日志出现 DevTools listening、没有端口绑定失败。
 2. CDP 连接后核对 `location.href` 与实际页面，`chrome-error://` 表示连到了错误页，不是业务组件不存在。
@@ -19,11 +22,14 @@ npx electron-vite dev -- --remote-debugging-port=9224
 
 main 修改没有生效时先核对 `packages/desktop/out/main/index.js` 是否重建；改 store 后 HMR 可能留下旧订阅或实例。**最终验收用干净重启，不把 HMR 异常当产品结论。**
 
-## 隔离与 seed
+## 数据目录与隔离
 
-- dev agent dir：`~/.pi/agent-dev/`。
-- 当前开发 userData：`~/Library/Application Support/@percho/desktop-dev/`；不要使用改名前的 `percho-dev/`。
-- 路径逻辑以 `main/dev-agent-dir.ts` 为准；自定义隔离路径时让验收脚本使用同一份路径。
+- **默认（开发 + 测试 + 验收，一律如此）**：dev 用**隔离副本** —— agent dir `~/.pi/agent-dev/`、userData `@percho/desktop-dev/`（Windows `%APPDATA%\@percho\desktop-dev`，macOS `~/Library/Application Support/@percho/desktop-dev`）。
+- **正式目录是用户真实数据，dev 任何路径都不得写入**：`~/.pi/agent/`（会话、memory、AGENTS.md、扩展、凭证）与正式 userData 只属于安装版和 CLI。dev 会写假会话、整份覆盖 `ui-state.json`、改 `settings.json`，共用一套就等于拿真实数据当夹具。验收脚本也把「正式目录零写入」写进了头部前提。
+- 隔离的副作用是**可与安装版同时运行**：单实例锁按 userData 划分，`desktop-dev` 与 `desktop` 是两把不同的锁。改 UI 时不用先关掉正在用的应用。
+- **要看真实会话/记忆/AGENTS.md 时**才用 `scripts\dev-shared.ps1`（等价于 `dev.ps1 -Shared` / `PERCHO_SHARED_DEV_DATA=1`）：agent dir 与 userData 都退回正式目录，此时与安装版互斥，必须先把安装版退出，否则会抢锁/EPERM。
+- 路径逻辑以 `main/dev-agent-dir.ts` 为准；隔离目录名被验收脚本硬编码（`check-font-size.mjs`、`check-sidebar-unified-scroll.mjs`、`shoot-rail.mjs`、`smoke-evaporation-ui.mjs`、`verify-channel-pill.mjs`、`verify-layout-freedom.mjs`），改名要同步这六个。
+- 单实例锁只能防「两边都带锁」的新构建；旧版安装包没有锁，与 dev 并存时仍可能 `ui-state.json` 写 EPERM —— 升级安装版即可。
 - `ui-state.json` 必须在实例停止后 seed，否则运行中的 persist 会覆盖。会话目录夹具通常也需重启才能读入。
 - 工作区快照使用 `sessionWorkspace`，不再有 `tabs.json`；冷启动可恢复有效 activeFile，不要假设总是新会话页。
 - 尽量通过真实 UI 进入目标状态；不得直接修改正式配置、会话或凭证来凑验收场景。

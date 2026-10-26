@@ -1,5 +1,5 @@
 import { composerDocumentFromText, type SessionEvent, type SessionMeta } from "@percho/shared";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /** window.pi 的 mock：sessions store 经 getPi() 访问，测试环境无 preload 注入 */
 const piMock = vi.hoisted(() => ({
@@ -1759,5 +1759,63 @@ describe("工作区接线", () => {
 		expect(useSessionsStore.getState().activeSessionId).toBe("h1");
 		expect(memberIds()).toEqual([]);
 		expect(activeFile()).toBeNull();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// 新会话默认权限档位（设置 → 通用）：只是 draft 的起步值，
+// 不覆盖逐会话记忆（sessionPermissionModes），也不动已开着的会话。
+// ---------------------------------------------------------------------------
+describe("新会话权限档位跟随全局默认", () => {
+	afterEach(() => {
+		useUiPreferencesStore.setState({ defaultPermissionMode: "default" });
+	});
+
+	it("全局默认 fullAccess：新 draft 从 fullAccess 起步（不再写死 default）", () => {
+		useUiPreferencesStore.setState({ defaultPermissionMode: "fullAccess" });
+		useSessionsStore.setState({ cwd: "/proj/a" });
+		useSessionsStore.getState().activateNewSessionDraft();
+		expect(useSessionsStore.getState().newSessionDraft?.permissionMode).toBe("fullAccess");
+	});
+
+	it("全局默认 default（缺省）：行为与历史一致", () => {
+		useSessionsStore.setState({ cwd: "/proj/a" });
+		useSessionsStore.getState().activateNewSessionDraft();
+		expect(useSessionsStore.getState().newSessionDraft?.permissionMode).toBe("default");
+	});
+
+	it("从真实会话点「＋」：会话有显式档位时继承它（记忆优先于全局默认）", () => {
+		useUiPreferencesStore.setState({ defaultPermissionMode: "default" });
+		useSessionsStore.setState({
+			sessions: [realMeta("a", "/proj/alpha")],
+			activeSessionId: "a",
+			cwd: "/proj/alpha",
+			permissionModes: { a: "fullAccess" },
+		});
+		useSessionsStore.getState().activateNewSessionDraft();
+		expect(useSessionsStore.getState().newSessionDraft?.permissionMode).toBe("fullAccess");
+	});
+
+	it("从真实会话点「＋」：会话无显式档位时落到全局默认", () => {
+		useUiPreferencesStore.setState({ defaultPermissionMode: "fullAccess" });
+		useSessionsStore.setState({
+			sessions: [realMeta("a", "/proj/alpha")],
+			activeSessionId: "a",
+			cwd: "/proj/alpha",
+			permissionModes: {},
+		});
+		useSessionsStore.getState().activateNewSessionDraft();
+		expect(useSessionsStore.getState().newSessionDraft?.permissionMode).toBe("fullAccess");
+	});
+
+	it("promotion：全局默认 fullAccess 的 draft 转正后写进后端与该会话（后端仍 default 起步）", async () => {
+		piMock.createSession.mockResolvedValue(realMeta("new-1", "/proj/a"));
+		useUiPreferencesStore.setState({ defaultPermissionMode: "fullAccess" });
+		useSessionsStore.setState({ cwd: "/proj/a" });
+		useSessionsStore.getState().activateNewSessionDraft();
+
+		expect(await useSessionsStore.getState().createSession()).toBe("new-1");
+		expect(piMock.setPermissionMode).toHaveBeenCalledWith({ sessionId: "new-1", mode: "fullAccess" });
+		expect(useSessionsStore.getState().permissionModes["new-1"]).toBe("fullAccess");
 	});
 });

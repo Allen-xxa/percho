@@ -1,5 +1,6 @@
 import type { AgentSessionEvent as PiAgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import type { ComposerDocument } from "./composer-document";
+import type { ShortcutOverrides } from "./shortcuts";
 import type { SkillInvocationDisplay } from "./skill-invocation";
 import type { SubagentRunData } from "./subagent";
 
@@ -48,6 +49,12 @@ export interface UiState {
 	 * 只存 app 本地 ui-state.json，**不写进 pi 的会话 jsonl**（那是 SDK 文件格式）；新会话/fork 仍从 default 起步。
 	 */
 	sessionPermissionModes: Record<string, PermissionMode>;
+	/**
+	 * **新会话默认权限档位**（设置 → 通用里配；缺省 `default`）。
+	 * 只是新会话/新会话草稿的**起步值**：不影响已开着的会话，也不覆盖逐会话记忆
+	 * （`sessionPermissionModes` 命中时仍按记忆恢复）。
+	 */
+	defaultPermissionMode: PermissionMode;
 	/**
 	 * 顶栏**是否显示临时会话工作区的胶囊**（顶栏本身常驻：窗口拖动、左栏开合、变更侧栏入口都在这里）。
 	 * 关闭后顶栏不再出胶囊，会话全在左侧栏；旧版本文件的 `topBarVisible` 已废弃（缺省 true）。
@@ -106,6 +113,11 @@ export interface UiState {
 	 * v10 起启动仍然是纯空会话页（与 pi 原生/Codex 一致），这里只让用户不用重选项目。
 	 */
 	lastCwd: string | null;
+	/**
+	 * 可配置快捷键的**覆盖值**（只存与出厂默认不同的动作，注册表见 `shortcuts.ts`）。
+	 * 存覆盖而非全量表：改默认键位时老文件自然跟随，文件也不会越用越大。
+	 */
+	shortcuts: ShortcutOverrides;
 }
 
 /** 会话元数据（IPC 往返用，独立于 pi 内部类型） */

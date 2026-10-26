@@ -338,6 +338,7 @@ export const en: Messages = {
 		category: {
 			general: "General",
 			appearance: "Appearance",
+			shortcuts: "Shortcuts",
 			models: "Models",
 			skills: "Skills",
 			mcp: "MCP",
@@ -347,6 +348,23 @@ export const en: Messages = {
 		},
 		language: "Language",
 		languageHint: "Follows system language by default",
+		// Shortcuts: action labels/hints live here; key names come from shared `formatChord`
+		shortcuts: {
+			composer: "Composer",
+			composerHint:
+				"Both the send and newline chords are recordable (Enter sends, Shift+Enter newlines by default); they can't share the same chord.",
+			send: "Send",
+			sendHint:
+				"Sends the current input. Record Ctrl+Enter here to get “Enter for newlines, Ctrl+Enter to send”.",
+			newline: "Newline",
+			newlineHint: "Inserts a line break without sending. Click, then press the chord; applies immediately.",
+			record: "Record shortcut for {key}",
+			recording: "Press a chord…",
+			recordHint: "Esc to cancel",
+			needModifier: "Needs at least one modifier (Ctrl / Alt / Shift), or Enter on its own",
+			conflict: "Already used by “{key}” — change that one first",
+			reset: "Reset to default ({key})",
+		},
 		appearance: {
 			tabBasics: "Basics",
 			tabUiPlugins: "UI Plugins",
@@ -381,6 +399,10 @@ export const en: Messages = {
 				"On by default. Evaporates aged tool output into self-describing stubs by watermark (e.g. “output evicted, re-read with the same arguments”): tool output truncated from 60%, evicted into placeholders from 85%; zero LLM calls, conversation text preserved, session files untouched. Switching applies without restarting sessions.",
 			off: "Disables all context management: no active compression/evaporation; the SDK's native compaction kicks in near the window limit. Long sessions may pause for compaction.",
 		},
+		defaultPermission: "Permission for new sessions",
+		defaultPermissionHint:
+			"Starting permission for new sessions (including the new-session draft): open sessions are unaffected and can still be switched from the permission button in the composer.",
+		defaultPermissionWarn: "New sessions won't ask for approval; risky actions are only recorded in the audit log.",
 		channelWatch: "Cross-session channel collaboration (channel-watch)",
 		channelWatchHint:
 			"After a session subscribes to a channel it watches .local/agent-work/channel/<topic>/ for file updates; writes from another session wake this session to pick them up (per the HANDOFF.md protocol). Subscriptions persist via appendEntry and restore on session reopen; built-in loop protection. On by default, fully effective for trusted projects.",

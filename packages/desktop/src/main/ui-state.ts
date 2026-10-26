@@ -4,6 +4,7 @@ import {
 	clampCodeFontSize,
 	clampSidebarWidth,
 	clampUiFontSize,
+	normalizeShortcutOverrides,
 	type PermissionMode,
 	type Rect,
 	type SessionWorkspaceSnapshot,
@@ -131,6 +132,8 @@ function normalize(parsed: UiStateFileShape): UiState {
 		// 置顶列表：脏值（手改文件/旧版本）过滤成非空字符串数组（渲染侧另会忽略未知 id）
 		pinnedSessions: stringArray(parsed.pinnedSessions),
 		sessionPermissionModes: permissionModeMap(parsed.sessionPermissionModes),
+		// 新会话默认档位：只认已知枚举，其余（缺字段/脏值）一律落 default（= 历史行为）
+		defaultPermissionMode: parsed.defaultPermissionMode === "fullAccess" ? "fullAccess" : "default",
 		// 顶栏是否显示工作区胶囊（旧字段 topBarVisible 已废弃：顶栏现在常驻，不再整条隐藏）
 		barSessionsVisible,
 		sessionRailEnabled,
@@ -151,6 +154,8 @@ function normalize(parsed: UiStateFileShape): UiState {
 		pinnedProjects: stringArray(parsed.pinnedProjects),
 		// 上次项目目录：只收非空字符串（旧文件/脏值 → null）
 		lastCwd: typeof parsed.lastCwd === "string" && parsed.lastCwd.length > 0 ? parsed.lastCwd : null,
+		// 快捷键覆盖值：未知动作/不在候选表的键位丢弃（只留与出厂默认不同的项，见 shared/shortcuts.ts）
+		shortcuts: normalizeShortcutOverrides(parsed.shortcuts),
 	};
 }
 

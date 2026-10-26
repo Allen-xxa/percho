@@ -1,3 +1,4 @@
+import "./npm-env";
 import "./pi-package-dir";
 import "./dev-agent-dir";
 import "./fix-path";
@@ -43,7 +44,29 @@ if (process.platform !== "darwin") Menu.setApplicationMenu(null);
 // 系统深浅色变化（或用户切换主题导致 themeSource 变更）→ 同步窗口底色与 Windows 窗口按钮覆盖层
 nativeTheme.on("updated", () => applyChromeTheme(nativeTheme.themeSource));
 
+// 单实例锁：两个进程同时写同一份 userData 会把会话 jsonl 写乱、ui-state.json 整份互相覆盖
+// （它是启动读一次、保存全量落盘），且不会有任何报错，只是数据悄悄坏掉。锁按 userData 目录划分，
+// 所以 dev 默认的 -dev userData 与安装版互不冲突，可以同时开着；只有显式 PERCHO_SHARED_DEV_DATA=1
+// 让 dev 回到正式 userData 时才与安装版互斥（见 dev-agent-dir.ts）。
+// 拿不到锁说明已有实例在跑：退出自己，并把已有窗口带回前台（符合用户「又点了一次」的预期）。
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+	app.quit();
+} else {
+	app.on("second-instance", () => {
+		const [win] = BrowserWindow.getAllWindows();
+		if (!win) return;
+		if (win.isMinimized()) win.restore();
+		win.show();
+		win.focus();
+	});
+}
+
 app.whenReady().then(async () => {
+	// app.quit() 不是同步终止：没拿到锁的进程也会走到这里，必须提前返回，否则会抢在退出前
+	// 初始化 backend 并建窗口（两个进程同时读写同一份数据，正是要防止的情况）。
+	if (!hasSingleInstanceLock) return;
+
 	initLogging(join(app.getPath("userData"), "logs"));
 	log.info("app ready", { version: app.getVersion(), userData: app.getPath("userData") });
 

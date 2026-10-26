@@ -11,6 +11,7 @@ export * from "./model-visibility";
 export * from "./packages";
 export * from "./session";
 export * from "./settings";
+export * from "./shortcuts";
 export * from "./sidebar";
 export * from "./skill-invocation";
 export * from "./subagent";

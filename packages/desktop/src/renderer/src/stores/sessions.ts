@@ -82,6 +82,8 @@ function makeDraft(
 		cwd?: string | null;
 		model?: { provider: string; modelId: string } | null;
 		thinkingLevel?: string | null;
+		/** 显式档位（从真实会话继承时传入）；缺省跟随设置 → 通用的新会话默认档位 */
+		permissionMode?: PermissionMode;
 	} = {},
 ): NewSessionDraftConfig {
 	const model = source.model ?? null;
@@ -91,7 +93,8 @@ function makeDraft(
 		model,
 		// 未定时先用「最近使用」占位（UI 立刻有值），但标成未定，等 loadModels 用持久化偏好回填
 		thinkingLevel: source.thinkingLevel ?? state.lastUsedThinkingLevel,
-		permissionMode: "default",
+		// 新会话起步档位 = 设置里的全局默认（默认 default）；逐会话记忆优先于它
+		permissionMode: source.permissionMode ?? useUiPreferencesStore.getState().defaultPermissionMode,
 		modelResolved: model != null,
 		thinkingResolved: source.thinkingLevel != null,
 		generation: draftGenerationSeq,
@@ -314,8 +317,8 @@ async function promoteDraft(draft: NewSessionDraftConfig): Promise<string | null
 		// 全新会话的历史底座天然为空；在首次用户消息前即确认就绪。
 		finishSessionHistory(meta.sessionId);
 		if (isLatestActivation(token)) rememberCwd(targetCwd);
-		// draft 上选过的权限档位（入口快照）：后端新会话一律 default 起步，这里补上
-		// （失败只 toast，不回滚转正）
+		// draft 上定的权限档位（入口快照）：后端新会话一律 default 起步，这里补上
+		// （可能是会话快照，也可能是设置 → 通用里的新会话默认；失败只 toast，不回滚转正）
 		if (draft.permissionMode !== "default") {
 			await useSessionsStore.getState().setSessionPermissionMode(meta.sessionId, draft.permissionMode);
 		}
@@ -460,7 +463,9 @@ export const useSessionsStore = create<SessionsStore>((_set, get) => ({
 				model: activeSession.model ?? state.lastUsedModel,
 				thinkingLevel: activeSession.thinkingLevel,
 			});
-			nextDraft.permissionMode = state.permissionModes[activeSession.sessionId] ?? "default";
+			nextDraft.permissionMode =
+				state.permissionModes[activeSession.sessionId] ??
+				useUiPreferencesStore.getState().defaultPermissionMode;
 			set({ activeSessionId: null, newSessionDraft: nextDraft });
 			ensureTrust(targetCwd);
 			return;

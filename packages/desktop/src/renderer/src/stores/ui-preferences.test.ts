@@ -7,6 +7,7 @@ const piMock = vi.hoisted(() => ({
 }));
 vi.mock("../api", () => ({ getPi: () => piMock }));
 
+import { DEFAULT_SHORTCUT_BINDINGS } from "@percho/shared";
 import { useUiPreferencesStore } from "./ui-preferences";
 
 /**
@@ -34,8 +35,11 @@ beforeEach(() => {
 		expandedGroupsTouched: false,
 		pinnedProjects: [],
 		lastCwd: null,
+		sessionPermissionModes: {},
+		defaultPermissionMode: "default",
 		uiFontSize: 13,
 		codeFontSize: 12.5,
+		shortcutBindings: DEFAULT_SHORTCUT_BINDINGS,
 	});
 });
 
@@ -335,5 +339,97 @@ describe("字号档位", () => {
 		piMock.saveUiState.mockClear();
 		useUiPreferencesStore.getState().setUiFontSize(15);
 		expect(piMock.saveUiState).not.toHaveBeenCalled();
+	});
+});
+
+describe("可配快捷键（shortcutBindings）", () => {
+	const newline = () => useUiPreferencesStore.getState().shortcutBindings["composer.newline"];
+	const send = () => useUiPreferencesStore.getState().shortcutBindings["composer.send"];
+
+	it("init 从 ui-state 恢复覆盖项", async () => {
+		piMock.loadUiState.mockResolvedValue({ shortcuts: { "composer.newline": { key: "enter", ctrl: true } } });
+		await useUiPreferencesStore.getState().init();
+		expect(newline()).toEqual({ key: "enter", ctrl: true });
+	});
+
+	it("init 脏值/缺字段回落出厂默认（Enter 发送 / Shift+Enter 换行）", async () => {
+		for (const raw of [{}, { shortcuts: "x" }, { shortcuts: { "composer.newline": { key: "k" } } }]) {
+			piMock.loadUiState.mockResolvedValue(raw);
+			await useUiPreferencesStore.getState().init();
+			expect(newline()).toEqual({ key: "enter", shift: true });
+			expect(send()).toEqual({ key: "enter" });
+		}
+	});
+
+	it("改键位：立即生效 + 落盘覆盖集", () => {
+		useUiPreferencesStore.getState().setShortcutChord("composer.newline", { key: "enter", alt: true });
+		expect(newline()).toEqual({ key: "enter", alt: true });
+		expect(piMock.saveUiState).toHaveBeenCalledWith({
+			state: { shortcuts: { "composer.newline": { key: "enter", alt: true } } },
+		});
+	});
+
+	it("同值不重复写盘（录到当前值 / 录不出合法键位时归一化回原值）", () => {
+		useUiPreferencesStore.getState().setShortcutChord("composer.newline", { key: "enter", shift: true });
+		// 裸字母不可录制 → 归一化回原值 → 不写盘
+		useUiPreferencesStore.getState().setShortcutChord("composer.newline", { key: "k" });
+		expect(piMock.saveUiState).not.toHaveBeenCalled();
+		expect(newline()).toEqual({ key: "enter", shift: true });
+	});
+
+	it("两个动作键位互斥：裸 Enter 只能属于其中一个", () => {
+		// 出厂默认下发送已占着裸 Enter，换行想抢也抢不走（面板会先拦下并提示）
+		useUiPreferencesStore.getState().setShortcutChord("composer.newline", { key: "enter" });
+		expect(piMock.saveUiState).not.toHaveBeenCalled();
+		expect(newline()).toEqual({ key: "enter", shift: true });
+	});
+
+	it("「Ctrl+Enter 发送、Enter 换行」：两个动作各改一次就成立", () => {
+		useUiPreferencesStore.getState().setShortcutChord("composer.send", { key: "enter", ctrl: true });
+		useUiPreferencesStore.getState().setShortcutChord("composer.newline", { key: "enter" });
+		expect(send()).toEqual({ key: "enter", ctrl: true });
+		expect(newline()).toEqual({ key: "enter" });
+		expect(piMock.saveUiState).toHaveBeenLastCalledWith({
+			state: {
+				shortcuts: { "composer.send": { key: "enter", ctrl: true }, "composer.newline": { key: "enter" } },
+			},
+		});
+	});
+
+	it("恢复默认（null）：键位回出厂默认，落盘是空覆盖集", () => {
+		useUiPreferencesStore.getState().setShortcutChord("composer.newline", { key: "enter", ctrl: true });
+		piMock.saveUiState.mockClear();
+		useUiPreferencesStore.getState().setShortcutChord("composer.newline", null);
+		expect(newline()).toEqual({ key: "enter", shift: true });
+		expect(piMock.saveUiState).toHaveBeenCalledWith({ state: { shortcuts: {} } });
+	});
+});
+
+describe("defaultPermissionMode（设置 → 通用的新会话默认档位）", () => {
+	it("缺省 default（旧版本 ui-state 无该字段）", () => {
+		expect(useUiPreferencesStore.getState().defaultPermissionMode).toBe("default");
+	});
+
+	it("切换后落盘；同值短路不重复写盘", () => {
+		useUiPreferencesStore.getState().setDefaultPermissionMode("fullAccess");
+		expect(useUiPreferencesStore.getState().defaultPermissionMode).toBe("fullAccess");
+		expect(piMock.saveUiState).toHaveBeenLastCalledWith({
+			state: { defaultPermissionMode: "fullAccess" },
+		});
+		const calls = piMock.saveUiState.mock.calls.length;
+		useUiPreferencesStore.getState().setDefaultPermissionMode("fullAccess");
+		expect(piMock.saveUiState.mock.calls.length).toBe(calls);
+	});
+
+	it("init 从 ui-state 恢复", async () => {
+		piMock.loadUiState.mockResolvedValue({ defaultPermissionMode: "fullAccess" });
+		await useUiPreferencesStore.getState().init();
+		expect(useUiPreferencesStore.getState().defaultPermissionMode).toBe("fullAccess");
+	});
+
+	it("init 加载失败/字段缺失时回落 default", async () => {
+		piMock.loadUiState.mockRejectedValue(new Error("no file"));
+		await useUiPreferencesStore.getState().init();
+		expect(useUiPreferencesStore.getState().defaultPermissionMode).toBe("default");
 	});
 });
